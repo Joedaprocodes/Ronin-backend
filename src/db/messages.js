@@ -176,7 +176,6 @@ export async function ensureMessageSchema(
     alter table ${messagesName} add column if not exists deleted boolean not null default false;
     alter table ${messagesName} add column if not exists edited boolean not null default false;
     alter table ${messagesName} add column if not exists reactions jsonb;
-    alter table ${guardSettingsName} add column if not exists toxicity_guard boolean not null default false;
     create index if not exists idx_messages_chat_time on ${messagesName}(chat_jid, timestamp desc);
     create index if not exists idx_messages_from_me on ${messagesName}(from_me);
     create table if not exists ${guardSettingsName} (
@@ -246,6 +245,8 @@ export async function ensureMessageSchema(
     );
     alter table ${autoReplyRulesName} add column if not exists quote boolean not null default true;
     alter table ${awaySettingsName} add column if not exists quote boolean not null default true;
+    -- Runs after the guard_settings create above (ALTER needs the table to exist).
+    alter table ${guardSettingsName} add column if not exists toxicity_guard boolean not null default false;
   `);
 }
 
