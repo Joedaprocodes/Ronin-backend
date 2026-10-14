@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import makeWASocket, {
   Browsers,
+  DEF_MEDIA_HOST,
   DisconnectReason,
   downloadMediaMessage,
   getContentType,
@@ -62,6 +63,21 @@ function joinNames(names) {
 /** A trimmed string, or null when it is empty/not a string. */
 function nonEmpty(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+/** The unresolvable media host WhatsApp puts on some media protos. */
+const PLACEHOLDER_MEDIA_HOST = "a.whatsapp.net";
+
+/**
+ * The hostname of a media proto's `url`, or null when it isn't an absolute URL
+ * (missing/relative URLs are fine: Baileys falls back to `directPath`).
+ */
+function mediaHost(url) {
+  try {
+    return new URL(url).hostname || null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -797,22 +813,30 @@ export class WhatsAppConnection extends EventEmitter {
   }
 
   /**
-   * Downloads an incoming message's media bytes (image/video/audio/document)
-   * via Baileys and stores them with this.mediaStore. Never throws: a failed
-   * download just yields null media so the message is still emitted and saved.
+   * Downloads an incoming message's media bytes (image/video/audio/document/
+   * sticker) via Baileys and stores them with this.mediaStore. Never throws: a
+   * failed download just yields null media so the message is still emitted and
+   * saved.
    */
   async #downloadIncomingMedia(msg) {
     if (!this.mediaStore) return null;
     const kind = getContentType(msg?.message);
     const type = MESSAGE_KIND_TO_TYPE[kind];
     if (!type || !msg?.key?.id) return null;
+    const part = msg.message?.[kind] ?? {};
+    // WhatsApp stamps some media protos (stickers especially) with the
+    // placeholder host "a.whatsapp.net", which doesn't resolve. Baileys prefers
+    // a proto's `url` host over its own default, so the fetch dies with
+    // ENOTFOUND and the message ends up stored without media. Ignore the
+    // placeholder and let the content be fetched from the real CDN instead.
+    const host =
+      mediaHost(part.url) === PLACEHOLDER_MEDIA_HOST ? DEF_MEDIA_HOST : null;
     try {
-      const buffer = await downloadMediaMessage(msg, "buffer", {}, {
+      const buffer = await downloadMediaMessage(msg, "buffer", host ? { host } : {}, {
         logger: this.logger,
         reuploadRequest: this.sock?.updateMediaMessage,
       });
       if (!Buffer.isBuffer(buffer) || !buffer.length) return null;
-      const part = msg.message?.[kind] ?? {};
       return this.mediaStore.save({
         id: msg.key.id,
         buffer,

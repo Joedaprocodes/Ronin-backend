@@ -41,6 +41,12 @@ export const useMultiFileAuthState = async () => ({
 
 const MEDIA_KINDS = ["imageMessage", "videoMessage", "audioMessage", "documentMessage", "stickerMessage"];
 
+/** Matches the real library's default media CDN host. */
+export const DEF_MEDIA_HOST = "mmg.whatsapp.net";
+
+/** Every options object downloadMediaMessage was called with (newest last). */
+export const __downloadCalls = [];
+
 /** Mirrors Baileys getContentType: the first known media/... content key. */
 export function getContentType(content) {
   if (!content) return null;
@@ -56,6 +62,7 @@ export function getContentType(content) {
  * url === "fail" simulates a download error.
  */
 export async function downloadMediaMessage(message, type, options, ctx) {
+  __downloadCalls.push(options ?? {});
   const kind = getContentType(message?.message);
   if (!kind) throw new Error("no media in message");
   const payload = message.message[kind];
@@ -76,6 +83,7 @@ export function __reset() {
   sockets.length = 0;
   sentCounter = 0;
   groupMetas = new Map();
+  __downloadCalls.length = 0;
 }
 
 export default function makeWASocket() {

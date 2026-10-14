@@ -8,7 +8,9 @@ import { join } from "node:path";
 
 const { WhatsAppConnection } = await import("../src/whatsapp/connection.js");
 const { createMediaStore } = await import("../src/media/store.js");
-const { __reset, __sockets, __setGroupMetas } = await import("./helpers/baileys-stub.mjs");
+const { __reset, __sockets, __setGroupMetas, __downloadCalls, DEF_MEDIA_HOST } = await import(
+  "./helpers/baileys-stub.mjs"
+);
 
 const tick = () => new Promise((r) => setTimeout(r, 5));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -520,6 +522,89 @@ test("incoming stickers are stored under the sticker bucket (not image)", async 
   assert.equal(m.media.mimeType, "image/webp");
   // stub downloadMediaMessage returns `${kind}:${url}`
   assert.deepEqual(readFileSync(join(dir, "in-sticker-1")), Buffer.from("stickerMessage:https://x/st"));
+});
+
+test("the a.whatsapp.net placeholder host is swapped for the default media CDN", async () => {
+  __reset();
+  const auth = makeAuth();
+  const dir = mkdtempSync(join(tmpdir(), "wa-media-"));
+  const saved = [];
+  const wa = new WhatsAppConnection({
+    auth,
+    messageStore: { save: async (m) => saved.push(m) },
+    mediaStore: createMediaStore({ dir }),
+  });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+
+  // WhatsApp stamps stickers (and some other media) with this host, which does
+  // not resolve; Baileys would prefer it over its own default and the download
+  // would fail with ENOTFOUND, leaving the message without media.
+  sock.ev.emit("messages.upsert", {
+    type: "notify",
+    messages: [
+      {
+        key: { id: "in-sticker-lid", remoteJid: "123@s.whatsapp.net", fromMe: false },
+        pushName: "Ada",
+        message: {
+          stickerMessage: {
+            mimetype: "image/webp",
+            url: "https://a.whatsapp.net",
+            directPath: "/v/t62.15575-24/845679714_n.enc?ccb=11-4",
+            mediaKey: "WkzRJB+6YXQmXxAfinJgulHT/Jb0ZC3udcMFFT4zFVM=",
+          },
+          messageContextInfo: { messageSecret: "s3cret" },
+        },
+      },
+    ],
+  });
+  await waitFor(() => saved.length >= 1);
+
+  assert.deepEqual(__downloadCalls.at(-1), { host: DEF_MEDIA_HOST }, "fetched from the real CDN");
+  assert.equal(DEF_MEDIA_HOST, "mmg.whatsapp.net");
+  const m = saved[0];
+  assert.equal(m.media.type, "sticker", "media stored despite the placeholder host");
+  assert.equal(m.media.mimeType, "image/webp");
+  assert.deepEqual(
+    readFileSync(join(dir, "in-sticker-lid")),
+    Buffer.from("stickerMessage:https://a.whatsapp.net")
+  );
+});
+
+test("a resolvable media host is passed through untouched", async () => {
+  __reset();
+  const auth = makeAuth();
+  const saved = [];
+  const wa = new WhatsAppConnection({
+    auth,
+    messageStore: { save: async (m) => saved.push(m) },
+    mediaStore: createMediaStore({ dir: mkdtempSync(join(tmpdir(), "wa-media-")) }),
+  });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+
+  sock.ev.emit("messages.upsert", {
+    type: "notify",
+    messages: [
+      {
+        key: { id: "in-media-cdn", remoteJid: "123@s.whatsapp.net", fromMe: false },
+        message: {
+          imageMessage: {
+            caption: "hi",
+            mimetype: "image/jpeg",
+            url: `https://${DEF_MEDIA_HOST}/v/t62/abc.enc`,
+            directPath: "/v/t62/abc.enc",
+          },
+        },
+      },
+    ],
+  });
+  await waitFor(() => saved.length >= 1);
+
+  assert.deepEqual(__downloadCalls.at(-1), {}, "no host override for a real host");
+  assert.equal(saved[0].media.type, "image");
 });
 
 test("outgoing stickers persist under the sticker bucket", async () => {
