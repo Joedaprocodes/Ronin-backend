@@ -249,6 +249,14 @@ export class WhatsAppConnection extends EventEmitter {
             await this.#applyProtocolMessage(msg.key, proto, remoteJid);
             continue;
           }
+          const secret = content?.secretEncryptedMessage ?? msg.message?.secretEncryptedMessage;
+          if (secret) {
+            console.log("[wa] secretEncryptedMessage", {
+              target: secret.targetMessageKey?.id,
+              type: secret.secretEncType,
+            });
+            continue;
+          }
           // Baileys also emits outgoing edits as a fresh upsert wrapped in
           // editedMessage (not protocolMessage). The inner proto holds the
           // original message key and the new text. Detect and apply it here so
@@ -327,6 +335,7 @@ export class WhatsAppConnection extends EventEmitter {
       sock.ev.on("messages.update", async (updates) => {
         if (sock !== this.sock) return;
         for (const item of updates ?? []) {
+          console.log("[wa] messages.update", JSON.stringify(updates, null, 2));
           const key = item?.key;
           const update = item?.update ?? {};
           if (!key?.id || !key.remoteJid) continue;
@@ -1132,7 +1141,8 @@ export class WhatsAppConnection extends EventEmitter {
     const isGroup = isGroupJid(remoteJid);
     let chat = remoteJid;
     if (!isGroup) {
-      chat = await this.#canonicalChat(remoteJid).catch(() => bareJid(remoteJid));
+      chat = await this.#canonicalChat(remoteJid);
+      chat = await this.#resolveCanonical(chat);
     }
     try {
       if (change.deleted && typeof store.markMessageDeleted === "function") {
