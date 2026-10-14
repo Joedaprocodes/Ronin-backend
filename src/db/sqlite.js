@@ -71,7 +71,9 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
       is_group   integer not null default 0,
       updated_at text    not null default (datetime('now')),
       read_at    text,
-      flagged    integer not null default 0
+      flagged    integer not null default 0,
+      group_snapshot    text,
+      group_snapshot_at text
     );
     create table if not exists chat_aliases (
       alias_jid     text primary key,
@@ -227,6 +229,12 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
     db.exec("alter table chats add column flagged integer not null default 0");
   }
   if (!chatColumns.includes("username")) db.exec("alter table chats add column username text");
+  if (!chatColumns.includes("group_snapshot")) {
+    db.exec("alter table chats add column group_snapshot text");
+  }
+  if (!chatColumns.includes("group_snapshot_at")) {
+    db.exec("alter table chats add column group_snapshot_at text");
+  }
   const messageColumns = db.prepare("pragma table_info(messages)").all().map((c) => c.name);
   if (!messageColumns.includes("media")) db.exec("alter table messages add column media text");
   if (!messageColumns.includes("quoted")) db.exec("alter table messages add column quoted text");
@@ -290,6 +298,18 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
   `);
   const moveChatMessages = db.prepare("update messages set chat_jid = ? where chat_jid = ?");
   const deleteChatRow = db.prepare("delete from chats where jid = ?");
+  const upsertGroupSnapshot = db.prepare(`
+    insert into chats (jid, is_group, group_snapshot, group_snapshot_at, updated_at)
+    values (?, 1, ?, ?, ?)
+    on conflict (jid) do update set
+      is_group          = 1,
+      group_snapshot    = excluded.group_snapshot,
+      group_snapshot_at = excluded.group_snapshot_at,
+      updated_at        = excluded.updated_at
+  `);
+  const selectGroupSnapshot = db.prepare(
+    "select group_snapshot, group_snapshot_at from chats where jid = ?"
+  );
   const selectRawPayloads = db.prepare("select chat_jid, raw_payload from messages where raw_payload is not null");
   const selectNewest = db.prepare(
     "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages where chat_jid = ? order by timestamp desc, id desc limit 1"
@@ -874,6 +894,35 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
     const row = selectChatFull.get(resolveChatJid(jid));
     const name = row?.name;
     return typeof name === "string" && name.trim() ? name : null;
+  }
+
+  /**
+   * Persists a group metadata snapshot on the group's chat row (see
+   * src/whatsapp/group-snapshot.js for the shape). Mirrors the Postgres store.
+   * A non-group jid is refused so a stray event can't seed a 1:1 row.
+   */
+  function saveGroupSnapshot(jid, snapshot) {
+    if (!jid || !isGroupJid(jid) || !snapshot) return;
+    upsertGroupSnapshot.run(jid, JSON.stringify(snapshot), nowIso(), nowIso());
+  }
+
+  /**
+   * The stored snapshot for a group, or null. Returns { snapshot, fetchedAt }
+   * with fetchedAt as epoch ms (0 when unknown) so the route can decide whether
+   * it is fresh enough to skip WhatsApp.
+   */
+  function getGroupSnapshot(jid) {
+    if (!jid) return null;
+    const row = selectGroupSnapshot.get(jid);
+    if (!row?.group_snapshot) return null;
+    let snapshot;
+    try {
+      snapshot = JSON.parse(row.group_snapshot);
+    } catch {
+      return null;
+    }
+    const at = row.group_snapshot_at ? new Date(row.group_snapshot_at).getTime() : 0;
+    return { snapshot, fetchedAt: Number.isFinite(at) ? at : 0 };
   }
 
   /**
@@ -1610,6 +1659,8 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
     canonicalizeChat,
     setChatName,
     resolveChatName,
+    saveGroupSnapshot,
+    getGroupSnapshot,
     saveTemplate,
     listTemplates,
     getTemplate,

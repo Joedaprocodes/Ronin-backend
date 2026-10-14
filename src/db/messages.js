@@ -170,6 +170,8 @@ export async function ensureMessageSchema(
     alter table ${chatsName} add column if not exists read_at timestamptz;
     alter table ${chatsName} add column if not exists flagged boolean not null default false;
     alter table ${chatsName} add column if not exists username text;
+    alter table ${chatsName} add column if not exists group_snapshot jsonb;
+    alter table ${chatsName} add column if not exists group_snapshot_at timestamptz;
     alter table ${messagesName} add column if not exists sender_email text;
     alter table ${messagesName} add column if not exists media jsonb;
     alter table ${messagesName} add column if not exists quoted jsonb;
@@ -809,6 +811,47 @@ export function createPostgresMessageStore({
     );
     const name = rows[0]?.name;
     return typeof name === "string" && name.trim() ? name : null;
+  }
+
+  /**
+   * Persists a group metadata snapshot on the group's chat row (see
+   * src/whatsapp/group-snapshot.js for the shape). Kept on `chats` so it
+   * survives redeploys with the rest of the database and needs no extra table.
+   * A non-group jid is refused so a stray event can't seed a 1:1 row.
+   */
+  async function saveGroupSnapshot(jid, snapshot) {
+    if (!jid || !isGroupJid(jid) || !snapshot) return;
+    await ensureMigrated();
+    await pool.query(
+      `insert into ${chatsName} (jid, is_group, group_snapshot, group_snapshot_at)
+       values ($1, true, $2::jsonb, now())
+       on conflict (jid) do update set
+         is_group         = true,
+         group_snapshot   = excluded.group_snapshot,
+         group_snapshot_at = excluded.group_snapshot_at,
+         updated_at       = excluded.group_snapshot_at`,
+      [jid, JSON.stringify(snapshot)]
+    );
+  }
+
+  /**
+   * The stored snapshot for a group, or null. Returns { snapshot, fetchedAt }
+   * with fetchedAt as epoch ms (0 when unknown) so the route can decide whether
+   * it is fresh enough to skip WhatsApp.
+   */
+  async function getGroupSnapshot(jid) {
+    if (!jid) return null;
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `select group_snapshot, group_snapshot_at from ${chatsName} where jid = $1`,
+      [jid]
+    );
+    const row = rows[0];
+    if (!row?.group_snapshot) return null;
+    return {
+      snapshot: row.group_snapshot,
+      fetchedAt: row.group_snapshot_at ? new Date(row.group_snapshot_at).getTime() : 0,
+    };
   }
 
   /** Later of two Date/timestamp values (null-safe). */
@@ -1702,6 +1745,8 @@ export function createPostgresMessageStore({
     canonicalizeChat,
     setChatName,
     resolveChatName,
+    saveGroupSnapshot,
+    getGroupSnapshot,
     saveTemplate,
     listTemplates,
     getTemplate,

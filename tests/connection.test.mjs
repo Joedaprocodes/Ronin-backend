@@ -1359,3 +1359,115 @@ test("groupMetadata throws when the socket is not open", async () => {
   await wa.start();
   await assert.rejects(() => wa.groupMetadata("123-456@g.us"), /not connected/);
 });
+
+/** In-memory store that also round-trips group snapshots. */
+function snapshotStore(initial = {}) {
+  const snapshots = new Map(Object.entries(initial));
+  const names = [];
+  return {
+    snapshots,
+    names,
+    save: async () => {},
+    setChatName: async (jid, name) => names.push([jid, name]),
+    saveGroupSnapshot: async (jid, snapshot) => {
+      snapshots.set(jid, snapshot);
+    },
+    getGroupSnapshot: async (jid) => {
+      const snapshot = snapshots.get(jid);
+      return snapshot ? { snapshot, fetchedAt: Date.now() } : null;
+    },
+  };
+}
+
+const SNAPSHOT_GROUP = "grp@g.us";
+
+test("group-participants.update keeps the cached snapshot roster current", async () => {
+  __reset();
+  const store = snapshotStore({
+    [SNAPSHOT_GROUP]: {
+      jid: SNAPSHOT_GROUP,
+      size: 2,
+      participants: [
+        { id: LID, username: null, phone: "2348052928072", admin: "admin" },
+        { id: PN, username: null, phone: "2348052928072", admin: null },
+      ],
+    },
+  });
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+
+  const roster = () => store.snapshots.get(SNAPSHOT_GROUP)?.participants ?? [];
+  const emit = (action, participants) =>
+    sock.ev.emit("group-participants.update", {
+      id: SNAPSHOT_GROUP,
+      author: "999@s.whatsapp.net",
+      participants,
+      action,
+    });
+
+  emit("add", [{ id: "555@s.whatsapp.net", notify: "Bob" }]);
+  await waitFor(() => roster().length === 3);
+
+  emit("promote", [{ id: "555@s.whatsapp.net" }]);
+  await waitFor(() => roster().find((p) => p.id === "555@s.whatsapp.net")?.admin === "admin");
+
+  emit("demote", [{ id: "555@s.whatsapp.net" }]);
+  await waitFor(() => roster().find((p) => p.id === "555@s.whatsapp.net")?.admin === null);
+
+  // Removing by the phone form drops the matching participant.
+  emit("remove", [{ id: "555@s.whatsapp.net" }]);
+  await waitFor(() => roster().length === 2);
+  assert.equal(store.snapshots.get(SNAPSHOT_GROUP).size, 2);
+});
+
+test("groups.upsert seeds a snapshot; a partial groups.update only patches one", async () => {
+  __reset();
+  const store = snapshotStore();
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+
+  sock.ev.emit("groups.upsert", [
+    {
+      id: SNAPSHOT_GROUP,
+      subject: "Family",
+      desc: "house",
+      participants: [{ id: PN, admin: "admin" }],
+    },
+  ]);
+  await waitFor(() => store.snapshots.has(SNAPSHOT_GROUP));
+  assert.equal(store.snapshots.get(SNAPSHOT_GROUP).name, "Family");
+  assert.equal(store.snapshots.get(SNAPSHOT_GROUP).participants.length, 1);
+
+  sock.ev.emit("groups.update", [{ id: SNAPSHOT_GROUP, subject: "Renamed", announce: true }]);
+  await waitFor(() => store.snapshots.get(SNAPSHOT_GROUP).name === "Renamed");
+  assert.equal(store.snapshots.get(SNAPSHOT_GROUP).description, "house", "untouched field kept");
+  assert.equal(store.snapshots.get(SNAPSHOT_GROUP).announce, true);
+
+  // A partial event for an unknown group never seeds a partial roster.
+  sock.ev.emit("groups.update", [{ id: "lonely@g.us", subject: "Nope" }]);
+  await tick();
+  assert.equal(store.snapshots.has("lonely@g.us"), false);
+});
+
+test("opening the socket warms a snapshot for every group", async () => {
+  __reset();
+  __setGroupMetas({
+    "123-456@g.us": { id: "123-456@g.us", subject: "Friends", participants: [{ id: PN }] },
+  });
+  try {
+    const store = snapshotStore();
+    const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+    await wa.start();
+    await openConnection(wa);
+
+    await waitFor(() => store.snapshots.has("123-456@g.us"));
+    assert.equal(store.snapshots.get("123-456@g.us").name, "Friends");
+    assert.equal(store.snapshots.get("123-456@g.us").participants.length, 1);
+  } finally {
+    __setGroupMetas({});
+  }
+});

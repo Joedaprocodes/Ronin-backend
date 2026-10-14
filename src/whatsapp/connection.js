@@ -20,6 +20,11 @@ import {
   isGroupJid,
 } from "./identity.js";
 import {
+  applyGroupPatch,
+  applyParticipantDelta,
+  toGroupSnapshot,
+} from "./group-snapshot.js";
+import {
   extractQuoted,
   extractText,
   getBaileysVersion,
@@ -143,6 +148,9 @@ export class WhatsAppConnection extends EventEmitter {
     this.jidCache = new Map();
     // Group jid -> { meta, at }: short-lived cache for guard admin checks
     this.groupMetaCache = new Map();
+    // Group jid -> Promise: serializes snapshot writes so a read-modify-write
+    // membership delta can't interleave with another event for the same group
+    this.groupSnapshotChain = new Map();
     // Recently handled message ids, so redeliveries aren't emitted twice
     this.seenIds = new Set();
     // lid|pn pairs already folded onto one canonical chat (avoids repeat work)
@@ -338,12 +346,13 @@ export class WhatsAppConnection extends EventEmitter {
 
       // Group subjects keep chats named. groups.update carries partial updates
       // ({ id, subject, ... }, subject present on renames), groups.upsert full
-      // metadata — both feed the same handler.
+      // metadata — both feed the same handler. The cached group snapshot is
+      // refreshed here too (patched on rename, reseeded on a full upsert).
       sock.ev.on("groups.update", (updates) => {
         this.#handleGroupUpdates(updates).catch((err) => this.emit("failure", err));
       });
       sock.ev.on("groups.upsert", (groups) => {
-        this.#handleGroupUpdates(groups).catch((err) => this.emit("failure", err));
+        this.#handleGroupUpdates(groups, { full: true }).catch((err) => this.emit("failure", err));
       });
 
       // Membership changes (add/remove/leave/promote/demote) become persisted
@@ -755,50 +764,103 @@ export class WhatsAppConnection extends EventEmitter {
    * partial updates ({ id, subject, ... } — subject present on renames) and
    * groups.upsert carries full group metadata; both use `subject`, so they
    * share this handler. Blank subjects are skipped (a group name is never
-   * erased by an empty rename event).
+   * erased by an empty rename event). The cached snapshot is updated alongside:
+   * `full` (groups.upsert) reseeds it, `partial` (groups.update) patches it.
    */
-  async #handleGroupUpdates(items) {
+  async #handleGroupUpdates(items, { full = false } = {}) {
     const store = this.messageStore;
-    if (!store || typeof store.setChatName !== "function") return;
+    if (!store) return;
     for (const item of items ?? []) {
       if (!item?.id) continue;
       const name = typeof item.subject === "string" ? item.subject.trim() : "";
-      if (!name) continue;
-      try {
-        await store.setChatName(item.id, name);
-      } catch (err) {
-        this.emit("failure", err);
+      if (name && typeof store.setChatName === "function") {
+        try {
+          await store.setChatName(item.id, name);
+        } catch (err) {
+          this.emit("failure", err);
+        }
       }
+      // Keep the persisted snapshot current. Full metadata (groups.upsert)
+      // seeds/overwrites it; a partial groups.update patches an existing one.
+      if (full) this.#saveGroupSnapshot(item);
+      else this.#updateGroupSnapshot(item.id, (current) => applyGroupPatch(current, item));
     }
   }
 
   /**
    * On connect, fetches the metadata of every group we participate in and
-   * persists each subject into chats.name. Uses the returned map directly
-   * (Baileys also emits groups.update for the same data — this just makes the
-   * write deterministic). Failures surface as "failure" events but never block
-   * messaging.
+   * persists each subject into chats.name plus a full group snapshot (so group
+   * info opens read from the store instead of hitting WhatsApp per group). Uses
+   * the returned map directly (Baileys also emits groups.update for the same
+   * data — this just makes the write deterministic). One batched request at
+   * connect replaces N per-group fetches. Failures surface as "failure" events
+   * but never block messaging.
    */
   async #backfillGroupNames() {
     const sock = this.sock;
     const store = this.messageStore;
-    if (!sock || !store || typeof store.setChatName !== "function") return;
+    if (!sock || !store) return;
     if (typeof sock.groupFetchAllParticipating !== "function") return;
     try {
       const groups = await sock.groupFetchAllParticipating();
       for (const meta of Object.values(groups ?? {})) {
         if (!meta?.id) continue;
         const name = typeof meta.subject === "string" ? meta.subject.trim() : "";
-        if (!name) continue;
-        try {
-          await store.setChatName(meta.id, name);
-        } catch (err) {
-          this.emit("failure", err);
+        if (name && typeof store.setChatName === "function") {
+          try {
+            await store.setChatName(meta.id, name);
+          } catch (err) {
+            this.emit("failure", err);
+          }
         }
+        this.#saveGroupSnapshot(meta);
       }
     } catch (err) {
       this.emit("failure", err);
     }
+  }
+
+  /**
+   * Serializes snapshot writes per group. Membership deltas are a
+   * read-modify-write, so two events for the same group landing back-to-back
+   * must not interleave. Errors surface as "failure" events.
+   */
+  #queueGroupSnapshot(jid, task) {
+    if (!jid) return;
+    const prev = this.groupSnapshotChain.get(jid) ?? Promise.resolve();
+    const next = prev
+      .catch(() => {})
+      .then(task)
+      .catch((err) => this.emit("failure", err));
+    this.groupSnapshotChain.set(jid, next);
+    void next.finally(() => {
+      if (this.groupSnapshotChain.get(jid) === next) this.groupSnapshotChain.delete(jid);
+    });
+  }
+
+  /** Persists a full metadata snapshot (best-effort, queued). */
+  #saveGroupSnapshot(meta) {
+    const store = this.messageStore;
+    if (!store || typeof store.saveGroupSnapshot !== "function") return;
+    const snapshot = toGroupSnapshot(meta);
+    if (!snapshot?.jid) return;
+    this.#queueGroupSnapshot(snapshot.jid, () => store.saveGroupSnapshot(snapshot.jid, snapshot));
+  }
+
+  /**
+   * Read-modify-writes a snapshot from an event. Never seeds a partial one: a
+   * single membership event must not make a group look like it has one member,
+   * so an absent snapshot is left for the connect-time warm or a live fetch.
+   */
+  #updateGroupSnapshot(jid, mutate) {
+    const store = this.messageStore;
+    if (!jid || !store || typeof store.saveGroupSnapshot !== "function") return;
+    if (typeof store.getGroupSnapshot !== "function") return;
+    this.#queueGroupSnapshot(jid, async () => {
+      const stored = await store.getGroupSnapshot(jid);
+      const next = mutate(stored?.snapshot ?? null);
+      if (next) await store.saveGroupSnapshot(jid, next);
+    });
   }
 
   /**
@@ -1129,6 +1191,13 @@ export class WhatsAppConnection extends EventEmitter {
     const { id: groupJid, action } = update ?? {};
     if (!store || !isGroupJid(groupJid)) return;
     if (!["add", "remove", "promote", "demote"].includes(action)) return;
+
+    // Keep the persisted snapshot current from the event itself — no WhatsApp
+    // query. This is independent of the actor/system-line logic below.
+    this.#updateGroupSnapshot(groupJid, (current) =>
+      applyParticipantDelta(current, action, update.participants)
+    );
+
     if (!update.author) return;
 
     const members = (update.participants ?? []).filter(

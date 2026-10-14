@@ -5,6 +5,10 @@ export const MAX_BACKOFF_MS = 30_000;
 export const PAIRING_CODE_TTL_MS = 3 * 60 * 1000; // ask for a fresh code once the old one expires
 export const JID_CACHE_TTL_MS = 10 * 60 * 1000; // how long a number -> JID lookup is reused
 export const GROUP_META_TTL_MS = 60 * 1000; // how long group metadata is reused for guard checks
+// How long a persisted group snapshot is trusted for GET /api/groups/:jid.
+// Socket broadcasts (join/leave/promote/rename) keep it current while
+// connected; this TTL is only the backstop for events missed while offline.
+export const GROUP_SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000;
 export const MAX_SEEN_IDS = 2000; // how many recent message ids we keep to drop redeliveries
 
 // fetchLatestBaileysVersion() hits the network, so fetch it once and reuse it.

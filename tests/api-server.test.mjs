@@ -2754,3 +2754,139 @@ test("GET /api/groups/:jid guards connection/state and maps failures", async () 
 
   store.close();
 });
+
+/* ------------------------------------------------------------------ */
+/*  Group info from a persisted snapshot                               */
+/* ------------------------------------------------------------------ */
+
+/** Store stub exposing just the snapshot surface the group route uses. */
+function snapshotGroupStore({ snapshot = null, fetchedAt = 0, names = {} } = {}) {
+  const state = { snapshot, fetchedAt, saved: [] };
+  return {
+    state,
+    getGroupSnapshot: async () =>
+      state.snapshot ? { snapshot: state.snapshot, fetchedAt: state.fetchedAt } : null,
+    saveGroupSnapshot: async (jid, value) => {
+      state.snapshot = value;
+      state.fetchedAt = Date.now();
+      state.saved.push(value);
+    },
+    setChatName: async () => {},
+    resolveChatName: async (jid) => names[jid] ?? null,
+  };
+}
+
+function countedGroupConnection({ state = "open", meta, error } = {}) {
+  const calls = { count: 0 };
+  return {
+    calls,
+    connection: {
+      getStatus: () => ({ state }),
+      groupMetadata: async (jid) => {
+        calls.count++;
+        if (error) throw error;
+        return meta ?? { id: jid };
+      },
+    },
+  };
+}
+
+const SNAPSHOT = {
+  jid: GROUP_JID,
+  name: "Family",
+  description: "house stuff",
+  owner: GROUP_PN,
+  ownerPn: GROUP_PN,
+  createdAt: GROUP_CREATION,
+  size: 1,
+  announce: false,
+  restrict: false,
+  isCommunity: false,
+  ephemeralDuration: null,
+  participants: [{ id: GROUP_LID, username: "josh", phone: "2348052928072", admin: "admin" }],
+};
+
+test("GET /api/groups/:jid serves a fresh snapshot without a WhatsApp read", async () => {
+  const store = snapshotGroupStore({
+    snapshot: SNAPSHOT,
+    fetchedAt: Date.now(),
+    names: { [GROUP_LID]: "Joshua Ayeni" },
+  });
+  const { calls, connection } = countedGroupConnection({ meta: { id: GROUP_JID, subject: "LIVE" } });
+  const api = createApiServer({ messageStore: store, connection, startScheduler: false });
+  const base = await listen(api);
+  try {
+    const res = await fetch(`${base}/api/groups/${encodeURIComponent(GROUP_JID)}`);
+    assert.equal(res.status, 200);
+    const { group } = await res.json();
+    assert.equal(group.name, "Family", "served from the snapshot");
+    assert.equal(group.participants[0].name, "Joshua Ayeni", "names still resolved from the store");
+    assert.equal(calls.count, 0, "no WhatsApp call for a fresh snapshot");
+    assert.equal(store.state.saved.length, 0, "nothing rewritten");
+  } finally {
+    await closeApi(api);
+  }
+});
+
+test("GET /api/groups/:jid refreshes an expired snapshot and saves the new one", async () => {
+  const store = snapshotGroupStore({
+    snapshot: SNAPSHOT,
+    fetchedAt: Date.now() - 25 * 60 * 60 * 1000, // older than the 24h TTL
+  });
+  const { connection, calls } = countedGroupConnection({
+    meta: { id: GROUP_JID, subject: "Renamed Live", participants: [{ id: GROUP_LID, admin: "admin" }] },
+  });
+  const api = createApiServer({ messageStore: store, connection, startScheduler: false });
+  const base = await listen(api);
+  try {
+    const res = await fetch(`${base}/api/groups/${encodeURIComponent(GROUP_JID)}`);
+    assert.equal(res.status, 200);
+    const { group } = await res.json();
+    assert.equal(group.name, "Renamed Live");
+    assert.equal(calls.count, 1, "an expired snapshot triggers one live read");
+    assert.equal(store.state.snapshot.name, "Renamed Live", "the snapshot is refreshed");
+  } finally {
+    await closeApi(api);
+  }
+});
+
+test("GET /api/groups/:jid serves a stale snapshot while offline", async () => {
+  const store = snapshotGroupStore({
+    snapshot: SNAPSHOT,
+    fetchedAt: Date.now() - 2 * 24 * 60 * 60 * 1000,
+    names: { [GROUP_LID]: "Joshua Ayeni" },
+  });
+  const { connection, calls } = countedGroupConnection({ state: "qr" });
+  const api = createApiServer({ messageStore: store, connection, startScheduler: false });
+  const base = await listen(api);
+  try {
+    const res = await fetch(`${base}/api/groups/${encodeURIComponent(GROUP_JID)}`);
+    assert.equal(res.status, 200, "offline serves the snapshot instead of 409");
+    const { group } = await res.json();
+    assert.equal(group.name, "Family");
+    assert.equal(group.stale, true);
+    assert.ok(group.fetchedAt, "fetchedAt is surfaced");
+    assert.equal(calls.count, 0);
+  } finally {
+    await closeApi(api);
+  }
+});
+
+test("GET /api/groups/:jid falls back to a stale snapshot when a live read fails", async () => {
+  const store = snapshotGroupStore({ snapshot: SNAPSHOT, fetchedAt: 0 });
+  const { connection, calls } = countedGroupConnection({
+    meta: null,
+    error: new Error("iq timeout"),
+  });
+  const api = createApiServer({ messageStore: store, connection, startScheduler: false });
+  const base = await listen(api);
+  try {
+    const res = await fetch(`${base}/api/groups/${encodeURIComponent(GROUP_JID)}`);
+    assert.equal(res.status, 200, "a transient live failure still serves the snapshot");
+    const { group } = await res.json();
+    assert.equal(group.stale, true);
+    assert.equal(calls.count, 1);
+  } finally {
+    await closeApi(api);
+  }
+});

@@ -1323,3 +1323,66 @@ test("clearAll empties every table", () => {
   db.close();
   store.close();
 });
+
+test("group snapshots round-trip on the chat row", () => {
+  const dir = tempDir();
+  const file = join(dir, "messages.db");
+  const store = createSqliteMessageStore({ file });
+  const snapshot = {
+    jid: "grp@g.us",
+    name: "Family",
+    participants: [{ id: PN, username: null, phone: "2348052928072", admin: "admin" }],
+  };
+
+  assert.equal(store.getGroupSnapshot("grp@g.us"), null, "no snapshot yet");
+
+  store.saveGroupSnapshot("grp@g.us", snapshot);
+  const stored = store.getGroupSnapshot("grp@g.us");
+  assert.deepEqual(stored.snapshot, snapshot);
+  assert.ok(stored.fetchedAt > 0, "fetchedAt recorded");
+
+  // The chat row is flagged as a group so it never reads as a 1:1.
+  const db = open(file);
+  const row = db.prepare("select is_group from chats where jid = ?").get("grp@g.us");
+  assert.equal(row.is_group, 1, "chat row flagged as a group");
+  db.close();
+
+  // A 1:1 jid is refused, so a stray event can't seed a snapshot on it.
+  store.saveGroupSnapshot(PN, snapshot);
+  assert.equal(store.getGroupSnapshot(PN), null);
+
+  store.close();
+});
+
+test("group snapshots migrate an existing chats table", () => {
+  const dir = tempDir();
+  const file = join(dir, "messages.db");
+
+  // A pre-snapshot schema, migrated by the store on creation.
+  const db = open(file);
+  db.exec(`
+    create table chats (
+      jid text primary key, name text, is_group integer not null default 0,
+      updated_at text not null default (datetime('now')), read_at text,
+      flagged integer not null default 0
+    );
+    create table messages (
+      id text primary key, chat_jid text references chats(jid), from_me integer not null,
+      sender_jid text, content text, media text, sender_email text,
+      timestamp text default (datetime('now')), raw_payload text
+    );
+  `);
+  db.close();
+
+  const store = createSqliteMessageStore({ file });
+  store.saveGroupSnapshot("grp@g.us", { jid: "grp@g.us", name: "M" });
+
+  const migrated = open(file);
+  const columns = migrated.prepare("pragma table_info(chats)").all().map((c) => c.name);
+  assert.ok(columns.includes("group_snapshot"), "group_snapshot column added");
+  assert.ok(columns.includes("group_snapshot_at"), "group_snapshot_at column added");
+  migrated.close();
+
+  assert.deepEqual(store.getGroupSnapshot("grp@g.us").snapshot, { jid: "grp@g.us", name: "M" });
+  store.close();
+});

@@ -15,8 +15,8 @@ import {
   validateAutoReply,
   validateAwaySettings,
 } from "../db/automation.js";
-import { canonicalId } from "../whatsapp/identity.js";
-import { PAIRING_CODE_TTL_MS } from "../whatsapp/utils.js";
+import { groupInfoFromSnapshot, toGroupSnapshot } from "../whatsapp/group-snapshot.js";
+import { GROUP_SNAPSHOT_TTL_MS, PAIRING_CODE_TTL_MS } from "../whatsapp/utils.js";
 
 const MAX_TEXT_LENGTH = 4096; // WhatsApp text limit
 const MAX_REACTION_LENGTH = 32; // an emoji plus room for a flag/ZWJ sequence
@@ -31,50 +31,6 @@ const MAX_SENDER_EMAIL = 320;
 const BROADCAST_POLL_MS = 15_000; // scheduled-broadcast scheduler tick
 const DEFAULT_MAX_MEDIA_BYTES = 20 * 1024 * 1024;
 const EVENT_HEARTBEAT_MS = 25_000; // ~25s SSE keep-alive comment
-
-/**
- * Maps live Baileys group metadata onto the public group-info response.
- * Participant ids are canonicalized (LID preferred) and each participant is
- * decorated with the best display name we have stored: the chat name first,
- * then their WhatsApp @username, then their phone digits.
- */
-async function toGroupInfo(meta, store) {
-  const participants = [];
-  for (const p of meta.participants ?? []) {
-    const id = canonicalId(p.id, p.lid);
-    let name = null;
-    if (store && typeof store.resolveChatName === "function") {
-      try {
-        name = await store.resolveChatName(id);
-      } catch {
-        name = null;
-      }
-    }
-    // p.phoneNumber is already a JID; for PN participants the id itself is one.
-    const phoneSrc = p.phoneNumber ?? (id.endsWith("@s.whatsapp.net") ? id : null);
-    participants.push({
-      id,
-      name,
-      username: typeof p.username === "string" && p.username ? p.username : null,
-      phone: phoneSrc ? String(phoneSrc).replace(/\D/g, "") || null : null,
-      admin: typeof p.admin === "string" && p.admin ? p.admin : null,
-    });
-  }
-  return {
-    jid: meta.id ?? null,
-    name: typeof meta.subject === "string" && meta.subject.trim() ? meta.subject : null,
-    description: typeof meta.desc === "string" && meta.desc.trim() ? meta.desc : null,
-    owner: meta.owner ? canonicalId(meta.owner, meta.ownerPn) : null,
-    ownerPn: meta.ownerPn ? canonicalId(meta.ownerPn) : null,
-    createdAt: Number.isInteger(meta.creation) ? new Date(meta.creation * 1000).toISOString() : null,
-    size: Number.isInteger(meta.size) ? meta.size : (meta.participants?.length ?? 0),
-    announce: Boolean(meta.announce),
-    restrict: Boolean(meta.restrict),
-    isCommunity: Boolean(meta.isCommunity),
-    ephemeralDuration: Number.isInteger(meta.ephemeralDuration) ? meta.ephemeralDuration : null,
-    participants,
-  };
-}
 
 function tokenMatches(provided, expected) {
   if (typeof provided !== "string" || typeof expected !== "string") return false;
@@ -1905,22 +1861,57 @@ export function createApiServer({
         return handleEditMessage(req, res, jid, id, body);
       }
 
-      // Group info is a live WhatsApp read (token-free GET, same posture as
-      // /api/account). It needs the connection open and maps Baileys
-      // metadata — including the resolved participant name enrichment — onto
-      // the public shape. Refreshing it also re-persists the latest subject.
+      // Group info is served from a persisted snapshot (see
+      // src/whatsapp/group-snapshot.js): a fresh snapshot answers with zero
+      // WhatsApp calls, and socket broadcasts keep it current while connected.
+      // A live read happens only for a cold/expired snapshot; an offline socket
+      // serves the last snapshot (marked stale) instead of failing.
       const groupMatch = path.match(/^\/api\/groups\/([^/]+)$/);
       if (req.method === "GET" && groupMatch) {
         if (!connection) {
           return sendJson(res, 503, { error: "no WhatsApp connection" });
         }
-        if (connection.getStatus?.().state !== "open") {
+        const jid = await resolveInboxJid(decodeURIComponent(groupMatch[1]));
+        const canSnapshot =
+          messageStore && typeof messageStore.getGroupSnapshot === "function";
+        const isOpen = connection.getStatus?.().state === "open";
+        const readSnapshot = async () => {
+          if (!canSnapshot) return null;
+          try {
+            return await messageStore.getGroupSnapshot(jid);
+          } catch {
+            return null;
+          }
+        };
+        const staleResponse = async (stored) => {
+          const group = await groupInfoFromSnapshot(stored.snapshot, messageStore);
+          return sendJson(res, 200, {
+            group: {
+              ...group,
+              stale: true,
+              fetchedAt: stored.fetchedAt ? new Date(stored.fetchedAt).toISOString() : null,
+            },
+          });
+        };
+
+        const stored = await readSnapshot();
+
+        // Offline: the last snapshot is the best we have (clearly marked).
+        if (!isOpen) {
+          if (stored?.snapshot) return staleResponse(stored);
           return sendJson(res, 409, { error: "WhatsApp is not connected" });
         }
+
+        // Online + fresh snapshot: answer without touching WhatsApp.
+        if (stored?.snapshot && Date.now() - (stored.fetchedAt ?? 0) < GROUP_SNAPSHOT_TTL_MS) {
+          return sendJson(res, 200, {
+            group: await groupInfoFromSnapshot(stored.snapshot, messageStore),
+          });
+        }
+
         if (typeof connection.groupMetadata !== "function") {
           return sendJson(res, 502, { error: "group metadata could not be read" });
         }
-        const jid = await resolveInboxJid(decodeURIComponent(groupMatch[1]));
         let meta;
         try {
           meta = await connection.groupMetadata(jid);
@@ -1928,11 +1919,15 @@ export function createApiServer({
           // Baileys throws a Boom whose output.statusCode carries the
           // downstream error's code (404 = unknown group, 409 = not open).
           const status = err?.output?.statusCode ?? err?.data?.statusCode;
+          // A transient live-read failure still serves the stale snapshot.
+          if (stored?.snapshot && status !== 404) return staleResponse(stored);
           if (status === 404) return sendJson(res, 404, { error: "group not found" });
           if (status === 409) return sendJson(res, 409, { error: "WhatsApp is not connected" });
           return sendJson(res, 502, { error: "group metadata could not be read" });
         }
         if (!meta) return sendJson(res, 502, { error: "group metadata could not be read" });
+
+        const snapshot = toGroupSnapshot(meta);
         // Keep the stored subject fresh for the inbox list.
         const subject = typeof meta.subject === "string" ? meta.subject.trim() : "";
         if (subject && meta.id && messageStore && typeof messageStore.setChatName === "function") {
@@ -1942,7 +1937,15 @@ export function createApiServer({
             // name refresh is best-effort
           }
         }
-        return sendJson(res, 200, { group: await toGroupInfo(meta, messageStore) });
+        // Persist the snapshot so later opens (and offline reads) are local.
+        if (snapshot?.jid && messageStore && typeof messageStore.saveGroupSnapshot === "function") {
+          try {
+            await messageStore.saveGroupSnapshot(snapshot.jid, snapshot);
+          } catch {
+            // snapshot persistence is best-effort
+          }
+        }
+        return sendJson(res, 200, { group: await groupInfoFromSnapshot(snapshot, messageStore) });
       }
 
       return sendJson(res, 404, { error: "not found" });

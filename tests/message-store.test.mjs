@@ -1467,3 +1467,55 @@ test("pg clearAll deletes every table in one transaction", async () => {
   assert.deepEqual(pool.transactions, ["begin", "commit"], "clearAll runs in one transaction");
   assert.equal(pool.client.released, true, "client must be released");
 });
+
+test("pg group snapshots migrate the chats table and upsert on save", async () => {
+  const pool = makeRowPool();
+  const store = createPostgresMessageStore({ pool });
+  const snapshot = { jid: "grp@g.us", name: "Family", participants: [{ id: "1@s.whatsapp.net" }] };
+  await store.saveGroupSnapshot("grp@g.us", snapshot);
+
+  const ddl = pool.calls[0].text;
+  assert.ok(
+    ddl.includes("add column if not exists group_snapshot jsonb"),
+    "snapshot column migration"
+  );
+  assert.ok(
+    ddl.includes("add column if not exists group_snapshot_at timestamptz"),
+    "snapshot timestamp migration"
+  );
+
+  const insert = pool.calls.find(
+    (c) => c.text.startsWith('insert into "public"."chats"') && c.text.includes("group_snapshot")
+  );
+  assert.ok(insert, "snapshot upsert issued");
+  assert.ok(insert.text.includes("on conflict (jid) do update"), "upsert semantics");
+  assert.equal(insert.params[0], "grp@g.us");
+  assert.deepEqual(JSON.parse(insert.params[1]), snapshot);
+
+  // A 1:1 jid is refused so a stray event can't seed a snapshot.
+  const before = pool.calls.length;
+  await store.saveGroupSnapshot("123@s.whatsapp.net", snapshot);
+  assert.equal(pool.calls.length, before, "non-group jid is a no-op");
+});
+
+test("pg getGroupSnapshot round-trips the snapshot and fetchedAt", async () => {
+  const fetchedAt = new Date("2026-02-01T10:00:00Z");
+  const pool = makeRowPool({
+    chats: [
+      {
+        group_snapshot: { jid: "grp@g.us", name: "Family" },
+        group_snapshot_at: fetchedAt,
+      },
+    ],
+  });
+  const store = createPostgresMessageStore({ pool, autoMigrate: false });
+
+  const stored = await store.getGroupSnapshot("grp@g.us");
+  assert.deepEqual(stored.snapshot, { jid: "grp@g.us", name: "Family" });
+  assert.equal(stored.fetchedAt, fetchedAt.getTime());
+
+  // A chat without a snapshot resolves to null rather than throwing.
+  const emptyPool = makeRowPool({ chats: [{ group_snapshot: null, group_snapshot_at: null }] });
+  const empty = createPostgresMessageStore({ pool: emptyPool, autoMigrate: false });
+  assert.equal(await empty.getGroupSnapshot("grp@g.us"), null);
+});
