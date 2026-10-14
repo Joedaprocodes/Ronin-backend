@@ -16,6 +16,7 @@ import {
   canonicalId,
   contactIdentity,
   identityPair,
+  isChannelJid,
   isGroupJid,
 } from "./identity.js";
 import {
@@ -219,7 +220,16 @@ export class WhatsAppConnection extends EventEmitter {
         const ownJid = this.sock?.user?.id ?? this.user?.id ?? null;
         for (const msg of messages) {
           const remoteJid = msg.key.remoteJid;
-          if (!remoteJid || remoteJid === "status@broadcast" || !msg.message) continue;
+          // Status broadcasts and WhatsApp Channels are not conversations: skip
+          // them before anything is downloaded, persisted or emitted, so a
+          // channel you follow never turns into an inbox thread.
+          if (
+            !remoteJid ||
+            remoteJid === "status@broadcast" ||
+            isChannelJid(remoteJid) ||
+            !msg.message
+          )
+            continue;
           // Revokes/edits arrive as protocol messages. Apply them to the stored
           // row (so the inbox never shows stale content) and skip persisting an
           // empty message for them.
@@ -292,7 +302,8 @@ export class WhatsAppConnection extends EventEmitter {
           const key = item?.key;
           const update = item?.update ?? {};
           if (!key?.id || !key.remoteJid) continue;
-          if (key.remoteJid === "status@broadcast") continue;
+          if (key.remoteJid === "status@broadcast" || isChannelJid(key.remoteJid))
+            continue;
           if (!("message" in update)) continue; // receipts/status changes carry no message
           const next = update.message;
           if (next?.protocolMessage) {
@@ -1055,7 +1066,13 @@ export class WhatsAppConnection extends EventEmitter {
     const store = this.messageStore;
     if (!store || typeof store.setMessageReaction !== "function") return;
     const target = item?.key;
-    if (!target?.id || !target.remoteJid || target.remoteJid === "status@broadcast") return;
+    if (
+      !target?.id ||
+      !target.remoteJid ||
+      target.remoteJid === "status@broadcast" ||
+      isChannelJid(target.remoteJid)
+    )
+      return;
 
     const reactionKey = item?.reaction?.key ?? {};
     const fromMe = Boolean(reactionKey.fromMe);

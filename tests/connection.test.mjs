@@ -261,6 +261,37 @@ test("messages.upsert persists every message to the store in order", async () =>
   assert.equal(saved[1].sender, "999@s.whatsapp.net");
 });
 
+test("messages.upsert ignores WhatsApp Channel traffic entirely", async () => {
+  __reset();
+  const saved = [];
+  const store = { save: async (m) => saved.push(m) };
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  await openConnection(wa);
+
+  const seen = [];
+  wa.on("message", (m) => seen.push(m));
+  __sockets().at(-1).ev.emit("messages.upsert", {
+    type: "notify",
+    messages: [
+      {
+        key: { id: "chan-1", remoteJid: "120363000000000000@newsletter" },
+        message: { imageMessage: { caption: "channel post" } },
+      },
+      {
+        key: { id: "dm-1", remoteJid: "111@s.whatsapp.net", fromMe: false },
+        message: { conversation: "hello" },
+      },
+    ],
+  });
+  await waitFor(() => saved.length >= 1);
+  await tick();
+  assert.equal(saved.length, 1, "only the DM is persisted");
+  assert.equal(saved[0].id, "dm-1");
+  assert.deepEqual(seen.map((m) => m.id), ["dm-1"], "no event for channel traffic");
+  assert.equal(__downloadCalls.length, 0, "channel media is never downloaded");
+});
+
 test("store.save failures surface as failure events without crashing", async () => {
   __reset();
   const auth = makeAuth();

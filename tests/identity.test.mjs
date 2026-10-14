@@ -8,6 +8,7 @@ const {
   clusterIdentities,
   contactIdentity,
   identityPair,
+  isChannelJid,
   isGroupJid,
   isLidJid,
   isPnJid,
@@ -16,18 +17,22 @@ const {
 
 const LID = "225159969521788@lid";
 const PN = "2348052928072@s.whatsapp.net";
+const CHANNEL = "120363000000000000@newsletter";
 
-test("classify/type guards recognize lid, pn, group and other", () => {
+test("classify/type guards recognize lid, pn, group, channel and other", () => {
   assert.equal(classify(LID), "lid");
   assert.equal(classify(PN), "pn");
   assert.equal(classify("123-456@g.us"), "group");
+  assert.equal(classify(CHANNEL), "channel");
   assert.equal(classify("status@broadcast"), "other");
   assert.equal(classify(null), "other");
 
   assert.equal(isLidJid(LID), true);
   assert.equal(isPnJid(PN), true);
   assert.equal(isGroupJid("123-456@g.us"), true);
+  assert.equal(isChannelJid(CHANNEL), true);
   assert.equal(isLidJid(PN), false);
+  assert.equal(isChannelJid(PN), false);
 });
 
 test("bareJid strips the device suffix but keeps the server", () => {

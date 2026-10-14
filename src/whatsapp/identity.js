@@ -16,6 +16,10 @@
 const LID_SUFFIX = "@lid";
 const PN_SUFFIX = "@s.whatsapp.net";
 const GROUP_SUFFIX = "@g.us";
+// WhatsApp Channels ("newsletters") deliver messages from a "...@newsletter"
+// jid. They are not people and not groups we belong to, so they must never be
+// ingested as conversations (see isChannelJid).
+const CHANNEL_SUFFIX = "@newsletter";
 
 /** "12345@lid" -> true (the stable identity behind usernames). */
 export function isLidJid(jid) {
@@ -32,6 +36,11 @@ export function isGroupJid(jid) {
   return typeof jid === "string" && jid.endsWith(GROUP_SUFFIX);
 }
 
+/** "1234567890@newsletter" -> true: a WhatsApp Channel, not a conversation. */
+export function isChannelJid(jid) {
+  return typeof jid === "string" && jid.endsWith(CHANNEL_SUFFIX);
+}
+
 /**
  * Drops a device suffix from a JID: "2348...:11@s.whatsapp.net" ->
  * "2348...@s.whatsapp.net". Non-JIDs (no "@") are returned unchanged.
@@ -44,10 +53,11 @@ export function bareJid(jid) {
   return `${user}${jid.slice(at)}`;
 }
 
-/** "lid" | "pn" | "group" | "other". */
+/** "lid" | "pn" | "group" | "channel" | "other". */
 export function classify(jid) {
   const b = bareJid(jid);
   if (isGroupJid(b)) return "group";
+  if (isChannelJid(b)) return "channel";
   if (isLidJid(b)) return "lid";
   if (isPnJid(b)) return "pn";
   return "other";
