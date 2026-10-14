@@ -249,6 +249,21 @@ export class WhatsAppConnection extends EventEmitter {
             await this.#applyProtocolMessage(msg.key, proto, remoteJid);
             continue;
           }
+          // Baileys also emits outgoing edits as a fresh upsert wrapped in
+          // editedMessage (not protocolMessage). The inner proto holds the
+          // original message key and the new text. Detect and apply it here so
+          // the edit never saves as a brand-new blank bubble.
+          const editedWrapper =
+            msg.message?.editedMessage ?? content?.editedMessage;
+          if (editedWrapper) {
+            const innerProto =
+              editedWrapper.message?.protocolMessage ??
+              normalizeMessageContent(editedWrapper.message)?.protocolMessage;
+            if (innerProto) {
+              await this.#applyProtocolMessage(msg.key, innerProto, remoteJid);
+              continue;
+            }
+          }
           // Reactions normally arrive on their own event; if one shows up here
           // anyway, apply it to the reacted-to message rather than storing the
           // emoji as a chat message.
