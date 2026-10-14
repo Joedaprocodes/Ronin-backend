@@ -106,6 +106,7 @@ export async function ensureMessageSchema(
       sender_email text,
       deleted      boolean     not null default false,
       edited       boolean     not null default false,
+      edits        jsonb,
       timestamp    timestamptz default now(),
       raw_payload  jsonb
     );
@@ -177,6 +178,7 @@ export async function ensureMessageSchema(
     alter table ${messagesName} add column if not exists quoted jsonb;
     alter table ${messagesName} add column if not exists deleted boolean not null default false;
     alter table ${messagesName} add column if not exists edited boolean not null default false;
+    alter table ${messagesName} add column if not exists edits jsonb;
     alter table ${messagesName} add column if not exists reactions jsonb;
     create index if not exists idx_messages_chat_time on ${messagesName}(chat_jid, timestamp desc);
     create index if not exists idx_messages_from_me on ${messagesName}(from_me);
@@ -320,7 +322,7 @@ export function createPostgresMessageStore({
   const serializeRaw = (msg) => JSON.stringify(msg, BufferJSON.replacer);
 
   const selectMessagesSql = `
-    select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions
+    select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions, edits
     from ${messagesName}`;
   const selectChatsSql = `
     select jid, name, is_group, flagged, read_at
@@ -388,6 +390,7 @@ export function createPostgresMessageStore({
       quoted: row.quoted ?? null,
       deleted: Boolean(row.deleted),
       edited: Boolean(row.edited),
+      edits: Array.isArray(row.edits) ? row.edits : [],
       reactions: row.reactions ?? null,
       system: row.raw_payload?.system ?? null,
       media: media
@@ -521,12 +524,29 @@ export function createPostgresMessageStore({
     return rowCount > 0;
   }
 
-  /** Replaces a message's text and flags it edited; returns whether it changed. */
+  /** Replaces a message's text, records its previous version in edits, and flags it edited; returns whether it changed. */
   async function updateMessageText(chat, id, text) {
     await ensureMigrated();
+    const { rows } = await pool.query(
+      `select content, timestamp, edits from ${messagesName} where chat_jid = $1 and id = $2`,
+      [chat, id]
+    );
+    if (!rows.length) return false;
+    const current = rows[0];
+    const newText = text ?? null;
+    if (current.content === newText) return false;
+
+    const history = Array.isArray(current.edits) ? [...current.edits] : [];
+    if (current.content != null) {
+      history.push({
+        text: current.content,
+        at: current.timestamp ? new Date(current.timestamp).toISOString() : new Date().toISOString(),
+      });
+    }
+
     const { rowCount } = await pool.query(
-      `update ${messagesName} set content = $1, edited = true where chat_jid = $2 and id = $3`,
-      [text ?? null, chat, id]
+      `update ${messagesName} set content = $1, edited = true, edits = $2::jsonb where chat_jid = $3 and id = $4`,
+      [newText, JSON.stringify(history), chat, id]
     );
     return rowCount > 0;
   }

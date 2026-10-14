@@ -85,6 +85,7 @@ export function toMessageView(m, isGroup) {
   };
   if (m.deleted) view.deleted = true;
   if (m.edited) view.edited = true;
+  if (Array.isArray(m.edits) && m.edits.length) view.edits = m.edits;
   if (m.system) view.system = m.system;
   if (m.reactions && typeof m.reactions === "object") {
     const reactions = [];

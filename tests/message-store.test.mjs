@@ -58,6 +58,8 @@ test("store creates schema on first save", async () => {
   assert.ok(ddl.includes("add column if not exists quoted jsonb"), "quoted column migration");
   assert.ok(ddl.includes("reactions jsonb"), "reactions column");
   assert.ok(ddl.includes("add column if not exists reactions jsonb"), "reactions column migration");
+  assert.ok(ddl.includes("edits jsonb"), "edits column");
+  assert.ok(ddl.includes("add column if not exists edits jsonb"), "edits column migration");
   assert.ok(ddl.includes("references \"public\".\"chats\"(jid)"), "FK to chats");
   assert.ok(ddl.includes("create index if not exists idx_messages_chat_time"), "chat time index");
   assert.ok(ddl.includes("create index if not exists idx_messages_from_me"), "from_me index");

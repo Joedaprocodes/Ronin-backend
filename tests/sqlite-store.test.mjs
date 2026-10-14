@@ -1386,3 +1386,48 @@ test("group snapshots migrate an existing chats table", () => {
   assert.deepEqual(store.getGroupSnapshot("grp@g.us").snapshot, { jid: "grp@g.us", name: "M" });
   store.close();
 });
+
+test("updateMessageText records edit history in edits column", async () => {
+  const dir = tempDir();
+  const file = join(dir, "messages.db");
+  const store = createSqliteMessageStore({ file });
+
+  await store.save({
+    id: "m1",
+    chat: "user@s.whatsapp.net",
+    fromMe: true,
+    text: "first version",
+  });
+
+  const initial = await store.getMessage("user@s.whatsapp.net", "m1");
+  assert.equal(initial.text, "first version");
+  assert.equal(initial.edited, false);
+  assert.deepEqual(initial.edits, []);
+
+  // First edit
+  const changed1 = store.updateMessageText("user@s.whatsapp.net", "m1", "second version");
+  assert.equal(changed1, true);
+
+  const v2 = await store.getMessage("user@s.whatsapp.net", "m1");
+  assert.equal(v2.text, "second version");
+  assert.equal(v2.edited, true);
+  assert.equal(v2.edits.length, 1);
+  assert.equal(v2.edits[0].text, "first version");
+
+  // Second edit
+  const changed2 = store.updateMessageText("user@s.whatsapp.net", "m1", "third version");
+  assert.equal(changed2, true);
+
+  const v3 = await store.getMessage("user@s.whatsapp.net", "m1");
+  assert.equal(v3.text, "third version");
+  assert.equal(v3.edited, true);
+  assert.equal(v3.edits.length, 2);
+  assert.equal(v3.edits[0].text, "first version");
+  assert.equal(v3.edits[1].text, "second version");
+
+  // No-op edit (same text)
+  assert.equal(store.updateMessageText("user@s.whatsapp.net", "m1", "third version"), false);
+
+  store.close();
+});
+

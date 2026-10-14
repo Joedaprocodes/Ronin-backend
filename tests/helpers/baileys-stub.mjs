@@ -56,6 +56,26 @@ export function getContentType(content) {
   return null;
 }
 
+/** Mirrors Baileys normalizeMessageContent: unwraps future-proof and protocol wrappers. */
+export function normalizeMessageContent(content) {
+  if (!content) return undefined;
+  for (let i = 0; i < 5; i++) {
+    const inner =
+      content?.ephemeralMessage ||
+      content?.viewOnceMessage ||
+      content?.documentWithCaptionMessage ||
+      content?.viewOnceMessageV2 ||
+      content?.viewOnceMessageV2Extension ||
+      content?.editedMessage ||
+      content?.associatedChildMessage ||
+      content?.groupStatusMessage ||
+      content?.groupStatusMessageV2;
+    if (!inner) break;
+    content = inner.message;
+  }
+  return content;
+}
+
 /**
  * Stub downloadMediaMessage: returns deterministic bytes derived from the
  * content kind + caption/url so tests can assert stored/vs-served round-trips.

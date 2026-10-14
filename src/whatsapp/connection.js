@@ -7,6 +7,7 @@ import makeWASocket, {
   downloadMediaMessage,
   getContentType,
   makeCacheableSignalKeyStore,
+  normalizeMessageContent,
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import { createFileAuth } from "./file-auth.js";
@@ -238,20 +239,24 @@ export class WhatsAppConnection extends EventEmitter {
             !msg.message
           )
             continue;
-          // Revokes/edits arrive as protocol messages. Apply them to the stored
-          // row (so the inbox never shows stale content) and skip persisting an
-          // empty message for them.
-          if (msg.message.protocolMessage) {
-            await this.#applyProtocolMessage(msg.key, msg.message.protocolMessage, remoteJid);
+          // Revokes/edits arrive as protocol messages (often wrapped in
+          // editedMessage or ephemeralMessage). Apply them to the stored row (so
+          // the inbox never shows stale content) and skip persisting an empty
+          // message for them.
+          const content = normalizeMessageContent(msg.message) ?? msg.message;
+          const proto = content?.protocolMessage ?? msg.message?.protocolMessage;
+          if (proto) {
+            await this.#applyProtocolMessage(msg.key, proto, remoteJid);
             continue;
           }
           // Reactions normally arrive on their own event; if one shows up here
           // anyway, apply it to the reacted-to message rather than storing the
           // emoji as a chat message.
-          if (msg.message.reactionMessage) {
+          const reaction = content?.reactionMessage ?? msg.message?.reactionMessage;
+          if (reaction) {
             await this.#applyReaction({
-              key: msg.message.reactionMessage.key,
-              reaction: { text: msg.message.reactionMessage.text, key: msg.key },
+              key: reaction.key,
+              reaction: { text: reaction.text, key: msg.key },
             });
             continue;
           }
@@ -275,7 +280,7 @@ export class WhatsAppConnection extends EventEmitter {
             fromMe: Boolean(msg.key.fromMe),
             sender,
             name: msg.pushName ?? null,
-            text: extractText(msg.message),
+            text: extractText(content) ?? extractText(msg.message),
             // Outgoing messages get their sender email from the send call that
             // persisted them eagerly; a delayed echo adds nothing new.
             senderEmail: null,
@@ -314,10 +319,19 @@ export class WhatsAppConnection extends EventEmitter {
             continue;
           if (!("message" in update)) continue; // receipts/status changes carry no message
           const next = update.message;
-          if (next?.protocolMessage) {
-            await this.#applyProtocolMessage(key, next.protocolMessage, key.remoteJid);
-          } else if (next === null) {
+          if (next === null) {
             await this.#applyRevoke(key.remoteJid, key.id);
+            continue;
+          }
+          const content = normalizeMessageContent(next) ?? next;
+          if (content?.protocolMessage) {
+            await this.#applyProtocolMessage(key, content.protocolMessage, key.remoteJid);
+          } else if (content) {
+            // An edit update emitted by Baileys carries the unwrapped edited inner message
+            const text = extractText(content);
+            if (text != null) {
+              await this.#applyMessageChange(key.remoteJid, key.id, { text });
+            }
           }
         }
       });
@@ -1077,7 +1091,8 @@ export class WhatsAppConnection extends EventEmitter {
     const target = proto?.key ?? key;
     if (!target?.id) return;
     if (proto?.type === 14 /* MESSAGE_EDIT */) {
-      const text = extractText(proto.editedMessage);
+      const editedContent = normalizeMessageContent(proto.editedMessage) ?? proto.editedMessage;
+      const text = extractText(editedContent);
       if (text == null) return;
       await this.#applyMessageChange(remoteJid, target.id, { text });
     } else if (proto?.type === 0 /* REVOKE */) {

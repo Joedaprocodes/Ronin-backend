@@ -692,6 +692,10 @@ function makeMemoryStore() {
     updateMessageText: async (chat, id, text) => {
       const row = rows.get(id);
       if (row) {
+        if (!row.edits) row.edits = [];
+        if (row.text != null && row.text !== text) {
+          row.edits.push({ text: row.text, at: new Date().toISOString() });
+        }
         row.text = text;
         row.edited = true;
       }
@@ -809,6 +813,74 @@ test("an incoming MESSAGE_EDIT protocol message updates the stored text", async 
   assert.equal(updates.length, 1);
   assert.equal(updates[0].text, "edited text");
   assert.equal(updates[0].edited, true);
+  assert.equal(store.rows.get("m1").edits.length, 1);
+  assert.equal(store.rows.get("m1").edits[0].text, "hi");
+});
+
+test("a messages.upsert with editedMessage wrapper edits the stored message and does not insert phantom", async () => {
+  __reset();
+  const store = makeMemoryStore();
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+
+  await store.save({ id: "m1", chat: "123@s.whatsapp.net", fromMe: false, sender: "123@s.whatsapp.net", text: "original" });
+  store.rows.get("m1").tsMs = Date.now();
+
+  sock.ev.emit("messages.upsert", {
+    type: "notify",
+    messages: [
+      {
+        key: { id: "edit-stanza-1", remoteJid: "123@s.whatsapp.net", fromMe: false },
+        message: {
+          editedMessage: {
+            message: {
+              protocolMessage: {
+                type: 14,
+                key: { id: "m1", remoteJid: "123@s.whatsapp.net" },
+                editedMessage: { conversation: "unwrapped edit" },
+              },
+            },
+          },
+        },
+      },
+    ],
+  });
+  await waitFor(() => store.rows.get("m1")?.edited);
+  assert.equal(store.rows.get("m1").text, "unwrapped edit");
+  assert.equal(store.rows.get("m1").edits.length, 1);
+  assert.equal(store.rows.get("m1").edits[0].text, "original");
+  assert.equal(store.rows.has("edit-stanza-1"), false);
+});
+
+test("a messages.update with editedMessage updates the stored message", async () => {
+  __reset();
+  const store = makeMemoryStore();
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+
+  await store.save({ id: "m1", chat: "123@s.whatsapp.net", fromMe: false, sender: "123@s.whatsapp.net", text: "first text" });
+  store.rows.get("m1").tsMs = Date.now();
+
+  sock.ev.emit("messages.update", [
+    {
+      key: { id: "m1", remoteJid: "123@s.whatsapp.net" },
+      update: {
+        message: {
+          editedMessage: {
+            message: { conversation: "second text" },
+          },
+        },
+      },
+    },
+  ]);
+  await waitFor(() => store.rows.get("m1")?.text === "second text");
+  assert.equal(store.rows.get("m1").edited, true);
+  assert.equal(store.rows.get("m1").edits.length, 1);
+  assert.equal(store.rows.get("m1").edits[0].text, "first text");
 });
 
 test("a messages.update revoke (message: null) tombstones the stored message", async () => {

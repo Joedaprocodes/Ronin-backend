@@ -91,6 +91,7 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
       sender_email text,
       deleted      integer not null default 0,
       edited       integer not null default 0,
+      edits        text,
       reactions    text,
       timestamp    text    default (datetime('now')),
       raw_payload  text
@@ -244,6 +245,7 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
   if (!messageColumns.includes("edited")) {
     db.exec("alter table messages add column edited integer not null default 0");
   }
+  if (!messageColumns.includes("edits")) db.exec("alter table messages add column edits text");
   if (!messageColumns.includes("reactions")) db.exec("alter table messages add column reactions text");
   const templateColumns = db.prepare("pragma table_info(templates)").all().map((c) => c.name);
   if (!templateColumns.includes("fallback_name")) {
@@ -272,10 +274,10 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const selectMessages = db.prepare(
-    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages"
+    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions, edits from messages"
   );
   const selectMessagesOf = db.prepare(
-    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages where chat_jid = ?"
+    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions, edits from messages where chat_jid = ?"
   );
   const selectChats = db.prepare("select jid, name, is_group, flagged, read_at from chats");
   const selectChat = db.prepare("select jid, name, is_group, flagged, read_at from chats where jid = ?");
@@ -312,19 +314,19 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
   );
   const selectRawPayloads = db.prepare("select chat_jid, raw_payload from messages where raw_payload is not null");
   const selectNewest = db.prepare(
-    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages where chat_jid = ? order by timestamp desc, id desc limit 1"
+    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions, edits from messages where chat_jid = ? order by timestamp desc, id desc limit 1"
   );
   const selectNewestThem = db.prepare(
-    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages where chat_jid = ? and from_me = 0 order by timestamp desc, id desc limit 1"
+    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions, edits from messages where chat_jid = ? and from_me = 0 order by timestamp desc, id desc limit 1"
   );
   const selectPageFirst = db.prepare(
-    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages where chat_jid = ? order by timestamp desc, id desc limit ?"
+    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions, edits from messages where chat_jid = ? order by timestamp desc, id desc limit ?"
   );
   // SQLite has no row-value comparison, so the keyset predicate is expanded
   // into the equivalent pair of conditions (same semantics as the Postgres
   // store's `(timestamp, id) < (?, ?)`).
   const selectPageBefore = db.prepare(`
-    select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions
+    select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions, edits
     from messages
     where chat_jid = ? and (timestamp < ? or (timestamp = ? and id < ?))
     order by timestamp desc, id desc
@@ -334,13 +336,13 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
   // the row's content (only the `deleted` flag flips) so an admin can still
   // reveal what was removed.
   const selectMessage = db.prepare(
-    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages where chat_jid = ? and id = ?"
+    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions, edits from messages where chat_jid = ? and id = ?"
   );
   const markMessageDeletedStmt = db.prepare(
     "update messages set deleted = 1 where chat_jid = ? and id = ?"
   );
   const updateMessageTextStmt = db.prepare(
-    "update messages set content = ?, edited = 1 where chat_jid = ? and id = ?"
+    "update messages set content = ?, edited = 1, edits = ? where chat_jid = ? and id = ?"
   );
   const updateMessageReactionsStmt = db.prepare(
     "update messages set reactions = ? where chat_jid = ? and id = ?"
@@ -562,6 +564,15 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
         reactions = null; // corrupt sidecar data: treat as no reactions
       }
     }
+    let edits = [];
+    if (row.edits) {
+      try {
+        const parsed = JSON.parse(row.edits);
+        if (Array.isArray(parsed)) edits = parsed;
+      } catch {
+        edits = [];
+      }
+    }
     return {
       id: row.id,
       chat: row.chat_jid,
@@ -573,6 +584,7 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
       quoted: quoted ?? null,
       deleted: Boolean(row.deleted),
       edited: Boolean(row.edited),
+      edits,
       reactions,
       system: raw?.system ?? null,
       media: media
@@ -671,9 +683,30 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
     return markMessageDeletedStmt.run(chat, id).changes > 0;
   }
 
-  /** Replaces a message's text and flags it edited; returns whether it changed. */
+  /** Replaces a message's text, records its previous version in edits, and flags it edited; returns whether it changed. */
   function updateMessageText(chat, id, text) {
-    return updateMessageTextStmt.run(text ?? null, chat, id).changes > 0;
+    const row = selectMessage.get(chat, id);
+    if (!row) return false;
+    const newText = text ?? null;
+    if (row.content === newText) return false;
+
+    let history = [];
+    if (row.edits) {
+      try {
+        const parsed = JSON.parse(row.edits);
+        if (Array.isArray(parsed)) history = parsed;
+      } catch {
+        history = [];
+      }
+    }
+    if (row.content != null) {
+      history.push({
+        text: row.content,
+        at: row.timestamp ? new Date(row.timestamp).toISOString() : new Date().toISOString(),
+      });
+    }
+
+    return updateMessageTextStmt.run(newText, JSON.stringify(history), chat, id).changes > 0;
   }
 
   /**
