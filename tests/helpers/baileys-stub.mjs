@@ -8,6 +8,15 @@ export const DisconnectReason = {
   restartRequired: 515,
 };
 
+// Mirrors the real library's Browsers helpers (canonical [OS, browser, version]).
+export const Browsers = {
+  ubuntu: (browser) => ["Ubuntu", browser, "22.04.4"],
+  macOS: (browser) => ["Mac OS", browser, "14.4.1"],
+  baileys: (browser) => ["Baileys", browser, "6.5.0"],
+  windows: (browser) => ["Windows", browser, "10.0.22631"],
+  android: (browser) => [browser, "Android", ""],
+};
+
 // Same shape as the real library: buffers serialize to base64 in { type, data }.
 export const BufferJSON = {
   replacer(key, value) {

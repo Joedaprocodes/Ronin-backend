@@ -101,7 +101,11 @@ export async function ensureMessageSchema(
       sender_jid   text,
       content      text,
       media        jsonb,
+      quoted       jsonb,
+      reactions    jsonb,
       sender_email text,
+      deleted      boolean     not null default false,
+      edited       boolean     not null default false,
       timestamp    timestamptz default now(),
       raw_payload  jsonb
     );
@@ -168,6 +172,10 @@ export async function ensureMessageSchema(
     alter table ${chatsName} add column if not exists username text;
     alter table ${messagesName} add column if not exists sender_email text;
     alter table ${messagesName} add column if not exists media jsonb;
+    alter table ${messagesName} add column if not exists quoted jsonb;
+    alter table ${messagesName} add column if not exists deleted boolean not null default false;
+    alter table ${messagesName} add column if not exists edited boolean not null default false;
+    alter table ${messagesName} add column if not exists reactions jsonb;
     alter table ${guardSettingsName} add column if not exists toxicity_guard boolean not null default false;
     create index if not exists idx_messages_chat_time on ${messagesName}(chat_jid, timestamp desc);
     create index if not exists idx_messages_from_me on ${messagesName}(from_me);
@@ -309,7 +317,7 @@ export function createPostgresMessageStore({
   const serializeRaw = (msg) => JSON.stringify(msg, BufferJSON.replacer);
 
   const selectMessagesSql = `
-    select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media
+    select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions
     from ${messagesName}`;
   const selectChatsSql = `
     select jid, name, is_group, flagged, read_at
@@ -374,12 +382,17 @@ export function createPostgresMessageStore({
       text: row.content ?? null,
       tsMs: row.timestamp ? new Date(row.timestamp).getTime() : 0,
       pushName: row.raw_payload?.pushName ?? null,
+      quoted: row.quoted ?? null,
+      deleted: Boolean(row.deleted),
+      edited: Boolean(row.edited),
+      reactions: row.reactions ?? null,
+      system: row.raw_payload?.system ?? null,
       media: media
         ? {
             type: media.type ?? null,
             mimeType: media.mimeType ?? null,
             fileName: media.fileName ?? null,
-            url: `/api/media/${media.key}`,
+            url: media.url ?? `/api/media/${media.key}`,
           }
         : null,
     };
@@ -405,7 +418,14 @@ export function createPostgresMessageStore({
     // same transaction. `on conflict (id) do nothing` also makes the write safe
     // against duplicate deliveries.
     const timestamp = new Date(message.receivedAt ?? Date.now()).toISOString();
-    const rawJson = serializeRaw(message.raw ?? null);
+    const rawPayload =
+      message.raw == null && !message.system
+        ? null
+        : {
+            ...(message.raw ?? {}),
+            ...(message.system ? { system: message.system } : {}),
+          };
+    const rawJson = rawPayload == null ? null : serializeRaw(rawPayload);
     const media = message.media ?? null;
 
     const client = await pool.connect();
@@ -418,8 +438,8 @@ export function createPostgresMessageStore({
         [message.chat, message.isGroup]
       );
       await client.query(
-        `insert into ${messagesName} (id, chat_jid, from_me, sender_jid, content, media, timestamp, sender_email, raw_payload)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+        `insert into ${messagesName} (id, chat_jid, from_me, sender_jid, content, media, quoted, timestamp, sender_email, raw_payload)
+         values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10::jsonb)
          on conflict (id) do nothing`,
         [
           message.id,
@@ -428,6 +448,7 @@ export function createPostgresMessageStore({
           message.sender ?? null,
           message.text ?? null,
           media ?? null,
+          message.quoted ?? null,
           timestamp,
           message.senderEmail ?? null,
           rawJson,
@@ -452,6 +473,82 @@ export function createPostgresMessageStore({
       { messages: msgs.rows.map(toMessageView), chats: chatsToMeta(chatRows.rows) },
       { summary: true, q }
     );
+  }
+
+  /** One stored message as a view (with its deleted/edited flags), or null. */
+  async function getMessage(chat, id) {
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `${selectMessagesSql} where chat_jid = $1 and id = $2`,
+      [chat, id]
+    );
+    return rows[0] ? toMessageView(rows[0]) : null;
+  }
+
+  /**
+   * The Baileys key stored for a message (needed to edit/revoke it on
+   * WhatsApp) and the raw content (needed to quote it in a reply), plus whether
+   * it was ours. Null when the row is unknown.
+   */
+  async function getMessageRaw(chat, id) {
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `select id, chat_jid, from_me, raw_payload, deleted from ${messagesName} where chat_jid = $1 and id = $2`,
+      [chat, id]
+    );
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      id: row.id,
+      chat: row.chat_jid,
+      fromMe: Boolean(row.from_me),
+      key: row.raw_payload?.key ?? null,
+      message: row.raw_payload?.message ?? null,
+      deleted: Boolean(row.deleted),
+    };
+  }
+
+  /** Flags a message deleted; returns whether a row changed. */
+  async function markMessageDeleted(chat, id) {
+    await ensureMigrated();
+    const { rowCount } = await pool.query(
+      `update ${messagesName} set deleted = true where chat_jid = $1 and id = $2`,
+      [chat, id]
+    );
+    return rowCount > 0;
+  }
+
+  /** Replaces a message's text and flags it edited; returns whether it changed. */
+  async function updateMessageText(chat, id, text) {
+    await ensureMigrated();
+    const { rowCount } = await pool.query(
+      `update ${messagesName} set content = $1, edited = true where chat_jid = $2 and id = $3`,
+      [text ?? null, chat, id]
+    );
+    return rowCount > 0;
+  }
+
+  /**
+   * Sets (or, with `entry = null`, removes) one reactor's reaction on a
+   * message. Reactions live in a JSON sidecar keyed by reactor ("me" or a bare
+   * jid), so each person has at most one per message and the latest write wins.
+   * Returns the updated map, or null when the message is unknown.
+   */
+  async function setMessageReaction(chat, id, reactor, entry) {
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `select reactions from ${messagesName} where chat_jid = $1 and id = $2`,
+      [chat, id]
+    );
+    if (!rows.length) return null;
+    const next = { ...(rows[0].reactions ?? {}) };
+    if (entry && entry.text) next[reactor] = entry;
+    else delete next[reactor];
+    await pool.query(
+      `update ${messagesName} set reactions = $1::jsonb where chat_jid = $2 and id = $3`,
+      [Object.keys(next).length ? JSON.stringify(next) : null, chat, id]
+    );
+    return next;
   }
 
   /** Unread badge: incoming messages newer than read_at (read_at null = all). */
@@ -732,7 +829,7 @@ export function createPostgresMessageStore({
             type: media.type ?? null,
             mimeType: media.mimeType ?? null,
             fileName: media.fileName ?? null,
-            url: `/api/media/${media.key}`,
+            url: media.url ?? `/api/media/${media.key}`,
           }
         : null,
       createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
@@ -1554,10 +1651,50 @@ export function createPostgresMessageStore({
     return rows.length > 0;
   }
 
+  /**
+   * Deletes every row from every table, in one transaction. Children go first
+   * (join/recipient/log tables) so the foreign keys stay satisfied.
+   *
+   * Powers the "clear backend data" action. The WhatsApp session lives in its
+   * own table (createPostgresAuth), not here, so the device stays linked.
+   *
+   * @returns {number} the number of tables emptied
+   */
+  async function clearAll() {
+    await ensureMigrated();
+    const tables = [
+      broadcastRecipientsName,
+      broadcastsName,
+      listContactsName,
+      listsName,
+      contactsName,
+      templatesName,
+      messagesName,
+      chatAliasesName,
+      chatsName,
+      moderationLogName,
+      guardStrikesName,
+      guardSettingsName,
+      autoReplyGroupsName,
+      autoReplyRulesName,
+      awayRepliesName,
+      awaySettingsName,
+    ];
+    await withTransaction(async (client) => {
+      for (const table of tables) await client.query(`delete from ${table}`);
+    });
+    return tables.length;
+  }
+
   return {
     save,
     listConversations,
     getMessages,
+    getMessage,
+    getMessageRaw,
+    markMessageDeleted,
+    updateMessageText,
+    setMessageReaction,
     markRead,
     setFlagged,
     resolveChatJid,
@@ -1607,5 +1744,6 @@ export function createPostgresMessageStore({
     saveAwaySettings,
     markAwayReply,
     hasAwayReply,
+    clearAll,
   };
 }

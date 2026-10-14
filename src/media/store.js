@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** Media kinds the send API accepts and the connection persists. */
-export const MEDIA_TYPES = ["image", "video", "audio", "document"];
+export const MEDIA_TYPES = ["image", "video", "audio", "document", "sticker"];
 
 /** Maps a Baileys message content kind to one of MEDIA_TYPES. */
 export const MESSAGE_KIND_TO_TYPE = {
@@ -11,14 +11,15 @@ export const MESSAGE_KIND_TO_TYPE = {
   videoMessage: "video",
   audioMessage: "audio",
   documentMessage: "document",
-  stickerMessage: "image", // stickers render like images
+  stickerMessage: "sticker",
 };
 
-const DEFAULT_MIME = {
+export const DEFAULT_MIME = {
   image: "image/jpeg",
   video: "video/mp4",
   audio: "audio/ogg",
   document: "application/octet-stream",
+  sticker: "image/webp",
 };
 
 /** Keys must never be able to escape the media dir. */
@@ -98,6 +99,30 @@ export function createMediaStore({ dir = "./data/media", maxBytes = 20 * 1024 * 
       } catch {
         return null; // unknown id (or bytes deleted)
       }
+    },
+
+    /**
+     * Deletes every stored item (bytes + sidecar). Best-effort: a file that is
+     * locked/missing is skipped rather than aborting the sweep.
+     * @returns {Promise<number>} how many files were removed
+     */
+    async clearAll() {
+      let names;
+      try {
+        names = readdirSync(dir);
+      } catch {
+        return 0; // dir is gone/unreadable: nothing left to clear
+      }
+      let removed = 0;
+      for (const name of names) {
+        try {
+          unlinkSync(join(dir, name));
+          removed += 1;
+        } catch {
+          // skip files we can't remove (raced/locked)
+        }
+      }
+      return removed;
     },
   };
 }

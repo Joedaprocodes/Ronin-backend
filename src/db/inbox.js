@@ -4,8 +4,14 @@
  * their rows into message views and call groupConversations() here, so the
  * two backends stay byte-for-byte consistent.
  *
- * A message view is:    { id, chat, fromMe, sender, text, tsMs, pushName, media? }
- *   media = { type, mimeType, fileName, url } when the message carries one.
+ * A message view is:    { id, chat, fromMe, sender, text, tsMs, pushName, media?, quoted?, deleted?, edited?, reactions?, system? }
+ *   media  = { type, mimeType, fileName, url } when the message carries one.
+ *   quoted = { id, text, media?: { type }, sender? } when it's a reply — the
+ *            display snapshot of the message it quotes (bytes are never fetched).
+ *   reactions = [{ text, from, sender? }] — one entry per reactor, derived from
+ *            the stored { "<reactor>": { text, at, name? } } map.
+ *   system  = { action, actor, participants } for group membership lines
+ *            ("Alice added Bob"); the row's `text` is the rendered sentence.
  *   (Internally the connection/column holds { key, type, mimeType, fileName };
  *   views derive url = /api/media/<key> from it.)
  * A chat meta is:       { name, isGroup, flagged, readAtMs }
@@ -60,11 +66,15 @@ export function looksLikeJid(jid) {
 
 /**
  * Turns one message into the shape the inbox API and the SSE stream expose:
- *   { id, from: "me"|"them", text, time, sender?, media? }
+ *   { id, from: "me"|"them", text, time, sender?, media?, quoted?, deleted?, edited? }
  * Accepts either a store view ({ ..., tsMs, pushName, media: {type,mimeType,
  * fileName,url} }) or the connection's simplified message ({ ..., receivedAt,
  * name, media: {key,type,mimeType,fileName} }) so the send response, the SSE
  * feed and a reloaded thread all produce byte-for-byte the same shape.
+ *
+ * `deleted`/`edited` are flags only; a deleted message still carries its
+ * original text/media/quoted here so an authorized admin can reveal it (the UI
+ * hides it behind a tombstone by default).
  */
 export function toMessageView(m, isGroup) {
   const view = {
@@ -73,6 +83,22 @@ export function toMessageView(m, isGroup) {
     text: m.text ?? "",
     time: new Date(m.tsMs ?? m.receivedAt ?? 0).toISOString(),
   };
+  if (m.deleted) view.deleted = true;
+  if (m.edited) view.edited = true;
+  if (m.system) view.system = m.system;
+  if (m.reactions && typeof m.reactions === "object") {
+    const reactions = [];
+    for (const [reactor, entry] of Object.entries(m.reactions)) {
+      if (!entry?.text) continue;
+      const mine = reactor === "me";
+      const item = { text: entry.text, from: mine ? "me" : "them" };
+      // In groups, name who reacted (the store freezes a display name when it
+      // knew one at ingest; otherwise show their number). DMs need no name.
+      if (!mine && isGroup) item.sender = entry.name || shortJid(reactor);
+      reactions.push(item);
+    }
+    if (reactions.length) view.reactions = reactions;
+  }
   if (m.media?.url || m.media?.key) {
     view.media = {
       type: m.media.type ?? null,
@@ -80,6 +106,18 @@ export function toMessageView(m, isGroup) {
       fileName: m.media.fileName ?? null,
       url: m.media.url ?? `/api/media/${m.media.key}`,
     };
+  }
+  if (m.quoted && (m.quoted.text || m.quoted.media?.type)) {
+    // The message this one replies to. `media` is the bucket only (shown as an
+    // icon + label); `sender` is named in groups, "You" for our own quotes.
+    view.quoted = {
+      id: m.quoted.id ?? null,
+      text: m.quoted.text ?? "",
+    };
+    if (m.quoted.media?.type) view.quoted.media = { type: m.quoted.media.type };
+    if (isGroup && m.quoted.sender) {
+      view.quoted.sender = m.quoted.fromMe ? "You" : shortJid(m.quoted.sender);
+    }
   }
   if (isGroup) {
     // Only name senders we actually know (the frontend already renders its own
@@ -228,7 +266,9 @@ export function groupConversations(
       jid,
       name,
       isGroup,
-      unread: msgs.filter((m) => !m.fromMe && m.tsMs > readAtMs).length,
+      // Group membership lines ("Alice added Bob") are activity, but they must
+      // not inflate the unread badge — WhatsApp treats them as notices.
+      unread: msgs.filter((m) => !m.fromMe && !m.system && m.tsMs > readAtMs).length,
       flagged: Boolean(meta.flagged),
       lastMessageAt: new Date(last.tsMs).toISOString(),
       time: relativeTime(last.tsMs),

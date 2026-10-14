@@ -482,6 +482,222 @@ test("GET /api/account returns 503 without a connection", async () => {
 });
 
 /* ------------------------------------------------------------------ */
+/*  Account: disconnect + pairing                                      */
+/* ------------------------------------------------------------------ */
+
+test("POST /api/account/disconnect logs the session out", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  let loggedOut = false;
+  const connection = {
+    getStatus: () => ({ state: loggedOut ? "closed" : "open" }),
+    logout: async () => {
+      loggedOut = true;
+    },
+  };
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  try {
+    const res = await fetch(`${base}/api/account/disconnect`, { method: "POST" });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.ok, true);
+    assert.equal(data.connected, false);
+    assert.equal(loggedOut, true);
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("POST /api/account/disconnect is token-gated when configured", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  let loggedOut = false;
+  const connection = {
+    getStatus: () => ({ state: "open" }),
+    logout: async () => {
+      loggedOut = true;
+    },
+  };
+  const api = createApiServer({ messageStore: store, connection, apiToken: "s3cret" });
+  const base = await listen(api);
+  try {
+    const denied = await fetch(`${base}/api/account/disconnect`, { method: "POST" });
+    assert.equal(denied.status, 401, "no token");
+    assert.equal(loggedOut, false, "must not log out without a token");
+
+    const ok = await fetch(`${base}/api/account/disconnect`, {
+      method: "POST",
+      headers: { "x-api-token": "s3cret" },
+    });
+    assert.equal(ok.status, 200, "correct token");
+    assert.equal(loggedOut, true);
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("POST /api/account/disconnect returns 503 without a connection", async () => {
+  const api = createApiServer({}); // no connection, no store
+  const base = await listen(api);
+  try {
+    const res = await fetch(`${base}/api/account/disconnect`, { method: "POST" });
+    assert.equal(res.status, 503);
+    assert.equal((await res.json()).error, "no WhatsApp connection");
+  } finally {
+    await closeApi(api);
+  }
+});
+
+test("POST /api/account/clear-data wipes the store and the media bytes", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const mediaStore = createMediaStore({ dir: mkdtempSync(join(tmpdir(), "wa-clear-")) });
+  await mediaStore.save({
+    id: "media-1",
+    buffer: Buffer.from("bytes"),
+    type: "image",
+    mimeType: "image/png",
+    fileName: "x.png",
+  });
+
+  store.save({
+    id: "m1",
+    chat: JID,
+    isGroup: false,
+    fromMe: false,
+    sender: JID,
+    text: "hello",
+    receivedAt: Date.now(),
+    raw: { key: { id: "m1" } },
+  });
+  store.createContact({ name: "Ada", phone: "2348011112222" });
+  store.saveTemplate({ title: "Hi", body: "there" });
+
+  // No connection passed: clearing data must not require a linked device.
+  const api = createApiServer({ messageStore: store, mediaStore });
+  const base = await listen(api);
+  try {
+    const res = await fetch(`${base}/api/account/clear-data`, { method: "POST" });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.ok, true);
+    assert.ok(data.mediaRemoved >= 1, "media files are removed");
+
+    assert.deepEqual(store.listConversations(), [], "chats are gone");
+    assert.deepEqual(store.listContacts(), [], "contacts are gone");
+    assert.deepEqual(store.listTemplates(), [], "templates are gone");
+    assert.equal(await mediaStore.read("media-1"), null, "bytes are gone");
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("POST /api/account/clear-data is token-gated when configured", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  store.createContact({ name: "Ada", phone: "2348011112222" });
+  const api = createApiServer({ messageStore: store, apiToken: "s3cret" });
+  const base = await listen(api);
+  try {
+    const denied = await fetch(`${base}/api/account/clear-data`, { method: "POST" });
+    assert.equal(denied.status, 401, "no token");
+    assert.equal(store.listContacts().length, 1, "must not clear without a token");
+
+    const ok = await fetch(`${base}/api/account/clear-data`, {
+      method: "POST",
+      headers: { "x-api-token": "s3cret" },
+    });
+    assert.equal(ok.status, 200, "correct token");
+    assert.deepEqual(store.listContacts(), []);
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("POST /api/account/clear-data returns 503 without a store", async () => {
+  const api = createApiServer({});
+  const base = await listen(api);
+  try {
+    const res = await fetch(`${base}/api/account/clear-data`, { method: "POST" });
+    assert.equal(res.status, 503);
+    assert.equal((await res.json()).error, "no message store");
+  } finally {
+    await closeApi(api);
+  }
+});
+
+function makePairingConnection({ state = "qr", phoneNumber = null } = {}) {
+  const paired = [];
+  return {
+    paired,
+    phoneNumber,
+    getStatus: () => ({ state }),
+    pair: async (number) => {
+      paired.push(number);
+      return "ABCD-EFGH";
+    },
+  };
+}
+
+test("POST /api/account/pair returns a pairing code", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makePairingConnection();
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  try {
+    const res = await fetch(`${base}/api/account/pair`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ phoneNumber: "2348012345678" }),
+    });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.ok, true);
+    assert.equal(data.code, "ABCD-EFGH");
+    assert.equal(typeof data.expiresInMs, "number");
+    assert.deepEqual(connection.paired, ["2348012345678"]);
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("POST /api/account/pair falls back to the configured phone number", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makePairingConnection({ phoneNumber: "2348012345678" });
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  try {
+    const res = await fetch(`${base}/api/account/pair`, { method: "POST" });
+    assert.equal(res.status, 200);
+    assert.deepEqual(connection.paired, ["2348012345678"]);
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("POST /api/account/pair returns 409 until the session is in qr", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makePairingConnection({ state: "closed" });
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  try {
+    const res = await fetch(`${base}/api/account/pair`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ phoneNumber: "2348012345678" }),
+    });
+    assert.equal(res.status, 409);
+    assert.deepEqual(connection.paired, [], "must not request a code before pairing is ready");
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+/* ------------------------------------------------------------------ */
 /*  Send endpoint                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -492,8 +708,10 @@ function makeFakeConnection({ state = "open", user = null, sendMessage } = {}) {
     getStatus: () => ({ state, user }),
     sendMessage:
       sendMessage ??
-      (async (to, content, email) => {
-        sends.push({ to, content, email });
+      (async (to, content, email, options) => {
+        // `options` only appears for quoted replies, so existing assertions on
+        // the plain `{ to, content, email }` record stay exact.
+        sends.push({ to, content, email, ...(options ? { options } : {}) });
         return { key: { id: `sent-${to}` } };
       }),
   };
@@ -565,6 +783,29 @@ test("send decodes image media into a Buffer with a caption", async () => {
     assert.equal(content.image.toString(), "abc");
     assert.equal(content.caption, "look");
     assert.ok(!("text" in content), "text is not sent alongside media (use caption)");
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("send packs a sticker as content.sticker with a webp mimetype", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makeFakeConnection();
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  try {
+    const res = await fetch(`${base}/api/inbox/${encodeURIComponent(JID)}/send`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ media: { type: "sticker", data: b64("webp") } }),
+    });
+    assert.equal(res.status, 200);
+    const { content } = connection.sends[0];
+    assert.ok(content.sticker instanceof Buffer, "sticker is a Buffer");
+    assert.equal(content.sticker.toString(), "webp");
+    assert.equal(content.mimetype, "image/webp", "mimetype defaults to webp");
+    assert.ok(!("text" in content), "stickers carry no text");
   } finally {
     await closeApi(api);
     store.close();
@@ -784,6 +1025,392 @@ test("send stays open when no API token is configured", async () => {
     });
     assert.equal(res.status, 200, "open without a token header when API_TOKEN is unset");
   } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("send with quotedId turns the send into a quoted reply", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makeFakeConnection();
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  try {
+    store.save({
+      id: "src-1",
+      chat: JID,
+      isGroup: false,
+      fromMe: false,
+      sender: JID,
+      text: "the original",
+      receivedAt: Date.now() - 10_000,
+      raw: {
+        key: { id: "src-1", remoteJid: JID, fromMe: false },
+        message: { conversation: "the original" },
+      },
+    });
+
+    const post = (body) =>
+      fetch(`${base}/api/inbox/${encodeURIComponent(JID)}/send`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+    const res = await post({ text: "my reply", quotedId: "src-1" });
+    assert.equal(res.status, 200);
+    const quoted = connection.sends[0].options?.quoted;
+    assert.equal(quoted.key.id, "src-1", "the stored key is reused");
+    assert.equal(quoted.message.conversation, "the original", "the raw content is quoted");
+
+    const plain = await post({ text: "plain" });
+    assert.equal(plain.status, 200);
+    assert.equal(connection.sends[1].options, undefined, "a plain send carries no quoted option");
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("send rejects an unusable quotedId (400 / 404 / 409)", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makeFakeConnection();
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  const url = `${base}/api/inbox/${encodeURIComponent(JID)}/send`;
+  const post = (body) =>
+    fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  try {
+    assert.equal((await post({ text: "hi", quotedId: 42 })).status, 400, "non-string quotedId");
+    assert.equal((await post({ text: "hi", quotedId: "nope" })).status, 404, "unknown target");
+
+    store.save({
+      id: "gone",
+      chat: JID,
+      isGroup: false,
+      fromMe: true,
+      sender: JID,
+      text: "deleted soon",
+      receivedAt: Date.now(),
+      raw: {
+        key: { id: "gone", remoteJid: JID, fromMe: true },
+        message: { conversation: "deleted soon" },
+      },
+    });
+    await store.markMessageDeleted(JID, "gone");
+    assert.equal((await post({ text: "hi", quotedId: "gone" })).status, 409, "deleted target");
+
+    store.save({
+      id: "no-content",
+      chat: JID,
+      isGroup: false,
+      fromMe: false,
+      sender: JID,
+      text: "key only",
+      receivedAt: Date.now(),
+      raw: { key: { id: "no-content", remoteJid: JID, fromMe: false } },
+    });
+    assert.equal((await post({ text: "hi", quotedId: "no-content" })).status, 409, "target without content");
+
+    assert.equal(connection.sends.length, 0, "no unusable quote reaches WhatsApp");
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/*  Edit & delete endpoints                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A fake connection that records delete/edit/react calls the routes make.
+ * Passing the store lets reactions write through the way the real connection
+ * does, so the route's refreshed response carries the new reaction.
+ */
+function makeEditableConnection(store = null) {
+  const conn = makeFakeConnection({ state: "open" });
+  conn.deletes = [];
+  conn.edits = [];
+  conn.deleteMessage = async (chat, key) => {
+    conn.deletes.push({ chat, key });
+  };
+  conn.editMessage = async (chat, key, text) => {
+    conn.edits.push({ chat, key, text });
+  };
+  conn.reactions = [];
+  conn.sendReaction = async (chat, id, text) => {
+    conn.reactions.push({ chat, id, text });
+    if (store) {
+      await store.setMessageReaction(chat, id, "me", text ? { text, at: Date.now() } : null);
+    }
+  };
+  return conn;
+}
+
+/** Seeds one of "our" messages (fromMe) with the raw key edit/delete need. */
+function seedOwnMessage(store, over = {}) {
+  const id = over.id ?? "own-1";
+  store.save({
+    id,
+    chat: JID,
+    isGroup: false,
+    fromMe: true,
+    sender: JID,
+    text: "original text",
+    receivedAt: Date.now() - 30_000,
+    raw: { key: { id, remoteJid: JID, fromMe: true } },
+    ...over,
+  });
+  return id;
+}
+
+test("PUT /api/inbox/:jid/messages/:id edits one of our messages", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makeEditableConnection();
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  try {
+    const id = seedOwnMessage(store);
+    const res = await fetch(`${base}/api/inbox/${encodeURIComponent(JID)}/messages/${id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "edited text" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.message.text, "edited text");
+    assert.equal(body.message.edited, true);
+    assert.equal(connection.edits.length, 1, "the connection edited once");
+    assert.equal(connection.edits[0].key.id, id);
+    assert.equal(connection.edits[0].text, "edited text");
+    assert.equal((await store.getMessage(JID, id)).text, "edited text", "persisted");
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("DELETE /api/inbox/:jid/messages/:id tombstones our message, keeping its text", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makeEditableConnection();
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  try {
+    const id = seedOwnMessage(store);
+    const res = await fetch(`${base}/api/inbox/${encodeURIComponent(JID)}/messages/${id}`, {
+      method: "DELETE",
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.message.deleted, true);
+    assert.equal(connection.deletes.length, 1, "the connection revoked once");
+    assert.equal(connection.deletes[0].key.id, id);
+    const stored = await store.getMessage(JID, id);
+    assert.equal(stored.deleted, true);
+    assert.equal(stored.text, "original text", "original text retained for admin reveal");
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("edit/delete reject messages that aren't ours", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makeEditableConnection();
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  try {
+    await store.save(seedMessage()); // fromMe: false
+    const url = `${base}/api/inbox/${encodeURIComponent(JID)}/messages/m1`;
+    assert.equal((await fetch(url, { method: "DELETE" })).status, 403);
+    const put = await fetch(url, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "nope" }),
+    });
+    assert.equal(put.status, 403);
+    assert.equal(connection.deletes.length, 0);
+    assert.equal(connection.edits.length, 0);
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("edit requires non-empty text; unknown messages 404", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makeEditableConnection();
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  try {
+    const id = seedOwnMessage(store);
+    const url = (mid) => `${base}/api/inbox/${encodeURIComponent(JID)}/messages/${mid}`;
+    const put = (mid, body) =>
+      fetch(url(mid), {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    assert.equal((await put(id, { text: "   " })).status, 400, "blank text rejected");
+    assert.equal((await put("nope", { text: "hi" })).status, 404, "unknown message");
+    assert.equal((await fetch(url("nope"), { method: "DELETE" })).status, 404);
+    assert.equal(connection.edits.length, 0);
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("edit/delete require the API token when one is configured", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makeEditableConnection();
+  const api = createApiServer({ messageStore: store, connection, apiToken: "secret" });
+  const base = await listen(api);
+  try {
+    const id = seedOwnMessage(store);
+    const url = `${base}/api/inbox/${encodeURIComponent(JID)}/messages/${id}`;
+    assert.equal((await fetch(url, { method: "DELETE" })).status, 401);
+    const put = await fetch(url, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "x" }),
+    });
+    assert.equal(put.status, 401);
+    assert.equal(connection.deletes.length, 0);
+    assert.equal(connection.edits.length, 0);
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/*  Reaction endpoint                                                  */
+/* ------------------------------------------------------------------ */
+
+test("POST /api/inbox/:jid/messages/:id/reaction reacts to any stored message", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makeEditableConnection(store);
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  try {
+    await store.save(seedMessage()); // an incoming message — not ours
+    const res = await fetch(
+      `${base}/api/inbox/${encodeURIComponent(JID)}/messages/m1/reaction`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "👍" }),
+      }
+    );
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.ok, true);
+    assert.deepEqual(body.message.reactions, [{ text: "👍", from: "me" }]);
+    assert.deepEqual(connection.reactions, [{ chat: JID, id: "m1", text: "👍" }]);
+    assert.equal((await store.getMessage(JID, "m1")).reactions.me.text, "👍", "persisted");
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("an empty reaction clears ours again", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makeEditableConnection(store);
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  try {
+    await store.save(seedMessage());
+    const url = `${base}/api/inbox/${encodeURIComponent(JID)}/messages/m1/reaction`;
+    const post = (text) =>
+      fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+    assert.equal((await post("❤️")).status, 200);
+    const cleared = await post("");
+    assert.equal(cleared.status, 200);
+    const body = await cleared.json();
+    assert.equal(body.message.reactions, undefined, "no reactions left");
+    assert.equal(connection.reactions.length, 2);
+    assert.equal(connection.reactions[1].text, "");
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("reactions reject unknown/deleted messages, long text and missing token", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makeEditableConnection(store);
+  const api = createApiServer({ messageStore: store, connection, apiToken: "secret" });
+  const base = await listen(api);
+  try {
+    await store.save(seedMessage()); // m1
+    await store.save(seedMessage({ id: "m2" }));
+    const url = (mid) => `${base}/api/inbox/${encodeURIComponent(JID)}/messages/${mid}/reaction`;
+    const post = (mid, text, token) =>
+      fetch(url(mid), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(token ? { "x-api-token": token } : {}),
+        },
+        body: JSON.stringify({ text }),
+      });
+
+    assert.equal((await post("m1", "👍")).status, 401, "token required");
+    assert.equal((await post("nope", "👍", "secret")).status, 404, "unknown message");
+    await store.markMessageDeleted(JID, "m1");
+    assert.equal((await post("m1", "👍", "secret")).status, 409, "deleted message");
+    assert.equal(
+      (await post("m2", "a".repeat(33), "secret")).status,
+      400,
+      "reaction too long"
+    );
+    // Nothing reached WhatsApp.
+    assert.equal(connection.reactions.length, 0);
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("GET /api/events forwards message:update frames", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const connection = makeEventConnection();
+  const api = createApiServer({ messageStore: store, connection });
+  const base = await listen(api);
+  const events = await openEvents(base, { jid: JID });
+  try {
+    assert.equal(await events.next(), ": connected", "initial comment frame");
+    connection.emit("message:update", {
+      id: "own-1",
+      chat: JID,
+      isGroup: false,
+      fromMe: true,
+      sender: JID,
+      text: "edited live",
+      tsMs: Date.now(),
+      deleted: false,
+      edited: true,
+    });
+    const frame = await events.next();
+    const payload = JSON.parse(frame.replace(/^data: /, ""));
+    assert.equal(payload.jid, JID);
+    assert.equal(payload.message.id, "own-1");
+    assert.equal(payload.message.text, "edited live");
+    assert.equal(payload.message.edited, true);
+  } finally {
+    await events.stop();
     await closeApi(api);
     store.close();
   }
@@ -1169,7 +1796,7 @@ test("templates: validation mirrors the send-path media rules", async () => {
     assert.equal((await postJson(base, "/api/templates", { title: "Long", body: "y".repeat(4097) })).status, 400);
     // unsupported media type
     assert.equal(
-      (await postJson(base, "/api/templates", { title: "Bad", media: { type: "sticker", data: "aGk=" } })).status,
+      (await postJson(base, "/api/templates", { title: "Bad", media: { type: "gif", data: "aGk=" } })).status,
       400
     );
     // document requires fileName AND mimeType

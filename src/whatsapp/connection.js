@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import makeWASocket, {
+  Browsers,
   DisconnectReason,
   downloadMediaMessage,
   getContentType,
@@ -16,6 +18,7 @@ import {
   isGroupJid,
 } from "./identity.js";
 import {
+  extractQuoted,
   extractText,
   getBaileysVersion,
   GROUP_META_TTL_MS,
@@ -23,6 +26,7 @@ import {
   MAX_BACKOFF_MS,
   MAX_SEEN_IDS,
   PAIRING_CODE_TTL_MS,
+  quotedFromTarget,
 } from "./utils.js";
 
 /**
@@ -46,6 +50,21 @@ function participantIsAdminIn(meta, target) {
 }
 
 /**
+ * "Bob" / "Bob and Carol" / "Bob, Carol and Dan" — the member list in a system
+ * line.
+ */
+function joinNames(names) {
+  const list = (names ?? []).filter(Boolean);
+  if (list.length <= 1) return list[0] ?? "someone";
+  return `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}`;
+}
+
+/** A trimmed string, or null when it is empty/not a string. */
+function nonEmpty(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+/**
  * Manages a single WhatsApp (Baileys) session.
  *
  * States: "idle" | "connecting" | "qr" | "open" | "closed" | "logged_out" | "replaced"
@@ -57,6 +76,7 @@ function participantIsAdminIn(meta, target) {
  *  - "pairing_code"  (code)             8-character code to type on the phone (phone-number mode)
  *  - "ready"         ({ id, name })     connected and authenticated
  *  - "message"       (message)          incoming/outgoing message (simplified shape)
+ *  - "message:update"(message)          an edit/revoke changed a stored message
  *  - "disconnected"  ({ code })         connection dropped (a reconnect may follow)
  *  - "logged_out"    ()                 the phone unlinked this session
  *  - "failure"       (err)              a (re)start attempt failed; a retry is scheduled
@@ -77,9 +97,10 @@ export class WhatsAppConnection extends EventEmitter {
     this.logger = pino({ level: logLevel });
     // Optional persistence for every message (e.g. createPostgresMessageStore)
     this.messageStore = messageStore;
-    // Optional on-disk media store (src/media/store.js): outgoing media bytes
-    // are written at send time and incoming messages are downloaded to it.
-    // When null, media is neither stored nor served.
+    // Optional media store (src/media/store.js on disk locally, or the
+    // production Supabase bucket from src/media/supabase.js): outgoing media
+    // bytes are stored at send time and incoming media is downloaded and
+    // stored too. When null, media is neither stored nor served.
     this.mediaStore = mediaStore;
     // Serializes saves so messages hit the store in arrival order
     this.saveChain = Promise.resolve();
@@ -157,7 +178,11 @@ export class WhatsAppConnection extends EventEmitter {
           keys: makeCacheableSignalKeyStore(authState.keys, this.logger),
         },
         logger: this.logger,
-        browser: ["Campaign Server", "Chrome", "1.0.0"],
+        // A canonical browser tuple. WhatsApp's pairing-code `companion_hello`
+        // validator rejects custom OS labels (e.g. "Campaign Server") with a
+        // 400 bad-request while Baileys still returns a (dead) code — the phone
+        // then shows "Couldn't link device". Use the library default instead.
+        browser: Browsers.macOS("Chrome"),
         markOnlineOnConnect: false, // don't show "online" every time the server connects
         syncFullHistory: false,
       });
@@ -175,9 +200,27 @@ export class WhatsAppConnection extends EventEmitter {
 
       sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (sock !== this.sock || type !== "notify") return;
+        const ownJid = this.sock?.user?.id ?? this.user?.id ?? null;
         for (const msg of messages) {
           const remoteJid = msg.key.remoteJid;
           if (!remoteJid || remoteJid === "status@broadcast" || !msg.message) continue;
+          // Revokes/edits arrive as protocol messages. Apply them to the stored
+          // row (so the inbox never shows stale content) and skip persisting an
+          // empty message for them.
+          if (msg.message.protocolMessage) {
+            await this.#applyProtocolMessage(msg.key, msg.message.protocolMessage, remoteJid);
+            continue;
+          }
+          // Reactions normally arrive on their own event; if one shows up here
+          // anyway, apply it to the reacted-to message rather than storing the
+          // emoji as a chat message.
+          if (msg.message.reactionMessage) {
+            await this.#applyReaction({
+              key: msg.message.reactionMessage.key,
+              reaction: { text: msg.message.reactionMessage.text, key: msg.key },
+            });
+            continue;
+          }
           if (msg.key.id && !this.#isNewMessage(msg.key.id)) continue; // skip redeliveries
 
           const isGroup = isGroupJid(remoteJid);
@@ -208,7 +251,10 @@ export class WhatsAppConnection extends EventEmitter {
             rawKey: msg.key,
             // What a quoted reply needs ({ key, message }); consumed by the
             // automation engine and ignored by message views/SSE.
-            quoted: { key: msg.key, message: msg.message },
+            quotedTarget: { key: msg.key, message: msg.message },
+            // Display-only snapshot of the message THIS one replies to (shown as
+            // the quote block in the UI); null when it isn't a reply.
+            quoted: extractQuoted(msg.message, ownJid),
           };
           // Download & store media bytes first (waited per message so saves and
           // SSE frames stay in arrival order). A failed download yields null
@@ -218,6 +264,36 @@ export class WhatsAppConnection extends EventEmitter {
 
           // Persist every message (incoming and outgoing) in order
           this.#saveMessage(message, msg);
+        }
+      });
+
+      // Edits and revokes that WhatsApp delivers as message *updates* (rather
+      // than as a fresh protocol message): mirror them onto the stored row so a
+      // reopened thread shows the current content.
+      sock.ev.on("messages.update", async (updates) => {
+        if (sock !== this.sock) return;
+        for (const item of updates ?? []) {
+          const key = item?.key;
+          const update = item?.update ?? {};
+          if (!key?.id || !key.remoteJid) continue;
+          if (key.remoteJid === "status@broadcast") continue;
+          if (!("message" in update)) continue; // receipts/status changes carry no message
+          const next = update.message;
+          if (next?.protocolMessage) {
+            await this.#applyProtocolMessage(key, next.protocolMessage, key.remoteJid);
+          } else if (next === null) {
+            await this.#applyRevoke(key.remoteJid, key.id);
+          }
+        }
+      });
+
+      // Reactions: WhatsApp delivers them on their own event (never through
+      // messages.upsert). One reactor keeps at most one reaction per message —
+      // a falsy `text` removes it.
+      sock.ev.on("messages.reaction", (updates) => {
+        if (sock !== this.sock) return;
+        for (const item of updates ?? []) {
+          this.#applyReaction(item).catch((err) => this.emit("failure", err));
         }
       });
 
@@ -241,6 +317,13 @@ export class WhatsAppConnection extends EventEmitter {
       });
       sock.ev.on("groups.upsert", (groups) => {
         this.#handleGroupUpdates(groups).catch((err) => this.emit("failure", err));
+      });
+
+      // Membership changes (add/remove/leave/promote/demote) become persisted
+      // system lines in the thread, e.g. "Alice added Bob" / "You removed Carol".
+      sock.ev.on("group-participants.update", (update) => {
+        if (sock !== this.sock) return;
+        this.#handleParticipantsUpdate(update).catch((err) => this.emit("failure", err));
       });
     } catch (err) {
       // Setup failed before we had a usable socket: stay retryable
@@ -473,8 +556,8 @@ export class WhatsAppConnection extends EventEmitter {
    *
    * Media bytes (when the content carries a Buffer under `image`/`video`/
    * `audio`/`document`) are stored via this.mediaStore and the persisted
-   * message carries the media ref ({ key, type, mimeType, fileName }), which
-   * message views turn into `media.url = /api/media/<key>`.
+   * message carries the media ref ({ key, type, mimeType, fileName }, plus a
+   * `url` for the Supabase bucket), which message views surface as media.url.
    *
    * Resolves with the Baileys send result plus a `persisted` field holding the
    * simplified message that was stored (null if the send returned no id).
@@ -514,6 +597,15 @@ export class WhatsAppConnection extends EventEmitter {
     // media is the store's { key, type, mimeType, fileName } ref (or null when
     // there is nothing to store, e.g. no mediaStore or oversized bytes).
     persisted.media = media;
+
+    // A quoted reply: snapshot the message we're quoting so the UI renders the
+    // same quote block for our own (and automation's) replies.
+    if (options?.quoted) {
+      persisted.quoted = quotedFromTarget(
+        options.quoted,
+        this.sock?.user?.id ?? this.user?.id ?? null
+      );
+    }
 
     // Mark the id as handled so the delayed echo is skipped, then write the
     // outgoing message now (same shape the upsert handler would build).
@@ -807,6 +899,44 @@ export class WhatsAppConnection extends EventEmitter {
     return sock.sendMessage(chat, { delete: key });
   }
 
+  /**
+   * Edits a previously sent text message via its Baileys key. WhatsApp only
+   * permits this for our own text messages, and only within a short window
+   * after sending; the server rejects it otherwise.
+   */
+  async editMessage(chat, key, text) {
+    const sock = this.#requireOpen();
+    if (!chat || !key?.id) throw new Error("cannot edit without a message key");
+    if (typeof text !== "string" || !text.trim()) {
+      throw new Error("cannot edit to an empty message");
+    }
+    return sock.sendMessage(chat, { text, edit: key });
+  }
+
+  /**
+   * Adds/removes our own reaction on a stored message. `text` is the emoji (or
+   * a falsy value to clear it). The send is written through to the store
+   * eagerly so the UI updates without waiting for the echo; returns the raw
+   * Baileys result.
+   */
+  async sendReaction(chat, id, text) {
+    const sock = this.#requireOpen();
+    if (!chat || !id) throw new Error("cannot react without a message key");
+    const store = this.messageStore;
+    const raw =
+      store && typeof store.getMessageRaw === "function"
+        ? await store.getMessageRaw(chat, id)
+        : null;
+    if (!raw) throw new Error("message not found");
+    if (!raw.key?.id) throw new Error("message cannot be reacted to");
+    const result = await sock.sendMessage(chat, { react: { text: text || "", key: raw.key } });
+    if (store && typeof store.setMessageReaction === "function") {
+      const entry = text ? { text, at: Date.now() } : null;
+      await store.setMessageReaction(chat, id, "me", entry);
+    }
+    return result;
+  }
+
   /** Removes members from a group (guards enforcement). Returns the raw result. */
   async removeParticipants(chat, jids) {
     const sock = this.#requireOpen();
@@ -839,5 +969,196 @@ export class WhatsAppConnection extends EventEmitter {
     const save = this.saveChain.then(() => this.messageStore.save({ ...message, raw: rawMessage }));
     this.saveChain = save.catch((err) => this.emit("failure", err));
     return save;
+  }
+
+  /**
+   * Applies a protocol message (a revoke or an edit) to the stored row of the
+   * message it targets, then announces the refreshed view. Other protocol types
+   * (ephemeral settings, sync notices, …) are ignored.
+   */
+  async #applyProtocolMessage(key, proto, remoteJid) {
+    const target = proto?.key ?? key;
+    if (!target?.id) return;
+    if (proto?.type === 14 /* MESSAGE_EDIT */) {
+      const text = extractText(proto.editedMessage);
+      if (text == null) return;
+      await this.#applyMessageChange(remoteJid, target.id, { text });
+    } else if (proto?.type === 0 /* REVOKE */) {
+      await this.#applyRevoke(remoteJid, target.id);
+    }
+  }
+
+  /** Marks a message deleted (a revoke) in the store and re-announces it. */
+  async #applyRevoke(remoteJid, id) {
+    if (!id) return;
+    await this.#applyMessageChange(remoteJid, id, { deleted: true });
+  }
+
+  /**
+   * Writes an edit/revoke through to the store and emits the refreshed view as
+   * "message:update" — deliberately distinct from "message" so the auto-reply
+   * and guards engines only ever see real, new traffic.
+   */
+  async #applyMessageChange(remoteJid, id, change) {
+    const store = this.messageStore;
+    if (!store) return;
+    const isGroup = isGroupJid(remoteJid);
+    let chat = remoteJid;
+    if (!isGroup) {
+      chat = await this.#canonicalChat(remoteJid).catch(() => bareJid(remoteJid));
+    }
+    try {
+      if (change.deleted && typeof store.markMessageDeleted === "function") {
+        await store.markMessageDeleted(chat, id);
+      } else if (change.text != null && typeof store.updateMessageText === "function") {
+        await store.updateMessageText(chat, id, change.text);
+      }
+      const view =
+        typeof store.getMessage === "function" ? await store.getMessage(chat, id) : null;
+      if (view) this.emit("message:update", { ...view, isGroup });
+    } catch (err) {
+      this.emit("failure", err);
+    }
+  }
+
+  /**
+   * Applies one reaction event — `{ key: reacted-to message, reaction: { text,
+   * key: reactor } }` — to the stored row and announces the refreshed view. An
+   * empty `reaction.text` removes that reactor's reaction. Reactions for
+   * messages we never stored (old history) are ignored.
+   */
+  async #applyReaction(item) {
+    const store = this.messageStore;
+    if (!store || typeof store.setMessageReaction !== "function") return;
+    const target = item?.key;
+    if (!target?.id || !target.remoteJid || target.remoteJid === "status@broadcast") return;
+
+    const reactionKey = item?.reaction?.key ?? {};
+    const fromMe = Boolean(reactionKey.fromMe);
+    const isGroup = isGroupJid(target.remoteJid);
+    let chat = target.remoteJid;
+    if (!isGroup) {
+      chat = await this.#canonicalChat(target.remoteJid).catch(() => bareJid(target.remoteJid));
+    }
+
+    const reactor = fromMe
+      ? "me"
+      : bareJid(reactionKey.participant || reactionKey.remoteJid || chat);
+    const text = typeof item?.reaction?.text === "string" ? item.reaction.text : "";
+
+    let entry = null;
+    if (text) {
+      entry = { text, at: Number(item?.reaction?.senderTimestampMs) || Date.now() };
+      if (isGroup && !fromMe) {
+        const name = await this.#chatName(reactor);
+        if (name) entry.name = name;
+      }
+    }
+
+    try {
+      await store.setMessageReaction(chat, target.id, reactor, entry);
+      const view =
+        typeof store.getMessage === "function" ? await store.getMessage(chat, target.id) : null;
+      if (view) this.emit("message:update", { ...view, isGroup });
+    } catch (err) {
+      this.emit("failure", err);
+    }
+  }
+
+  /** The stored display name for a jid, when the store knows one. */
+  async #chatName(jid) {
+    const store = this.messageStore;
+    if (!store || typeof store.resolveChatName !== "function") return null;
+    try {
+      return (await store.resolveChatName(jid)) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Turns a group membership change into a persisted system line:
+   * "Alice added Bob", "You removed Carol", "Bob left", "You demoted Dan".
+   * Stored as a normal message row carrying `system` metadata (so it paginates
+   * and persists with the thread) and announced as "message:update" — never
+   * "message" — so the auto-reply/guards engines ignore it.
+   */
+  async #handleParticipantsUpdate(update) {
+    const store = this.messageStore;
+    const { id: groupJid, action } = update ?? {};
+    if (!store || !isGroupJid(groupJid)) return;
+    if (!["add", "remove", "promote", "demote"].includes(action)) return;
+    if (!update.author) return;
+
+    const members = (update.participants ?? []).filter(
+      (p) => p && (p.id || p.lid || p.phoneNumber)
+    );
+    if (!members.length) return;
+
+    const labelOf = (jid) => {
+      const user = String(jid ?? "").split("@")[0].split(":")[0];
+      return user || "someone";
+    };
+    const nameOf = (p) =>
+      nonEmpty(p.notify) ||
+      nonEmpty(p.name) ||
+      nonEmpty(p.username) ||
+      labelOf(p.phoneNumber || p.id || p.lid);
+
+    const ownJid = this.sock?.user?.id ?? this.user?.id ?? null;
+    const ownBare = ownJid ? bareJid(ownJid) : null;
+    const authorForms = [update.author, update.authorPn]
+      .filter(Boolean)
+      .map((jid) => bareJid(jid));
+    const isAuthor = (p) =>
+      [p.id, p.lid, p.phoneNumber]
+        .filter(Boolean)
+        .some((jid) => authorForms.includes(bareJid(jid)));
+    const byMe = Boolean(ownBare) && authorForms.includes(ownBare);
+
+    let actorName = byMe ? "You" : null;
+    if (!actorName) {
+      const actorParticipant = members.find(isAuthor);
+      actorName =
+        (actorParticipant ? nameOf(actorParticipant) : null) ||
+        (await this.#chatName(bareJid(update.author))) ||
+        nonEmpty(update.authorUsername) ||
+        labelOf(update.author);
+    }
+
+    const memberJids = members.map((p) => bareJid(p.id || p.lid || p.phoneNumber));
+    const leftOnOwn = action === "remove" && members.every(isAuthor);
+    const list = joinNames(members.map(nameOf));
+    let text;
+    if (action === "add") text = `${actorName} added ${list}`;
+    else if (action === "promote") text = `${actorName} promoted ${list} to admin`;
+    else if (action === "demote") text = `${actorName} demoted ${list}`;
+    else if (leftOnOwn) text = `${actorName} left`;
+    else text = `${actorName} removed ${list}`;
+
+    const message = {
+      id: `sys-${Date.now()}-${randomUUID().slice(0, 8)}`,
+      chat: groupJid,
+      isGroup: true,
+      fromMe: false,
+      sender: bareJid(update.author),
+      name: null,
+      text,
+      senderEmail: null,
+      receivedAt: Date.now(),
+      rawKey: null,
+      quotedTarget: null,
+      quoted: null,
+      system: { action, actor: bareJid(update.author), participants: memberJids },
+    };
+
+    try {
+      await this.#saveMessage(message, null);
+      const view =
+        typeof store.getMessage === "function" ? await store.getMessage(groupJid, message.id) : null;
+      if (view) this.emit("message:update", { ...view, isGroup: true });
+    } catch (err) {
+      this.emit("failure", err);
+    }
   }
 }

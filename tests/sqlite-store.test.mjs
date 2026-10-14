@@ -346,6 +346,37 @@ test("getMessages returns an ascending thread or null", () => {
   store.close();
 });
 
+test("getMessageRaw exposes the stored key and content for replies", () => {
+  const dir = tempDir();
+  const file = join(dir, "messages.db");
+  const store = createSqliteMessageStore({ file });
+  store.save(
+    base({
+      id: "src",
+      chat: "r@s.whatsapp.net",
+      fromMe: false,
+      sender: "r@s.whatsapp.net",
+      raw: {
+        key: { id: "src", remoteJid: "r@s.whatsapp.net" },
+        message: { conversation: "hello" },
+      },
+    })
+  );
+
+  const raw = store.getMessageRaw("r@s.whatsapp.net", "src");
+  assert.equal(raw.id, "src");
+  assert.equal(raw.key.id, "src");
+  assert.equal(raw.message.conversation, "hello");
+
+  // A key-only payload still yields a key (edit/delete), but no quotable content.
+  store.save(
+    base({ id: "keyonly", chat: "r@s.whatsapp.net", raw: { key: { id: "keyonly" } } })
+  );
+  assert.equal(store.getMessageRaw("r@s.whatsapp.net", "keyonly").message, null);
+  assert.equal(store.getMessageRaw("r@s.whatsapp.net", "missing"), null);
+  store.close();
+});
+
 test("getMessages pages through a thread with keyset cursors", () => {
   const dir = tempDir();
   const file = join(dir, "messages.db");
@@ -1165,5 +1196,130 @@ test("identities: migrates an existing chats table without a username column", (
   const tables = migrated.prepare("select name from sqlite_master where type='table'").all().map((r) => r.name);
   assert.ok(tables.includes("chat_aliases"), "alias table added");
   migrated.close();
+  store.close();
+});
+
+test("reactions: setMessageReaction stores, replaces and clears per reactor", () => {
+  const dir = tempDir();
+  const store = createSqliteMessageStore({ file: join(dir, "messages.db") });
+  store.save(base({ id: "m1", chat: PN, raw: { key: { id: "m1", remoteJid: PN } } }));
+
+  assert.deepEqual(store.setMessageReaction(PN, "m1", "me", { text: "👍", at: 111 }), {
+    me: { text: "👍", at: 111 },
+  });
+  assert.deepEqual(store.getMessage(PN, "m1").reactions, { me: { text: "👍", at: 111 } });
+
+  // Another reactor coexists; ours is untouched.
+  store.setMessageReaction(PN, "m1", "234@s.whatsapp.net", { text: "❤️", at: 222, name: "Ada" });
+  assert.deepEqual(store.getMessage(PN, "m1").reactions, {
+    me: { text: "👍", at: 111 },
+    "234@s.whatsapp.net": { text: "❤️", at: 222, name: "Ada" },
+  });
+
+  // One reactor keeps a single reaction, and null removes it.
+  store.setMessageReaction(PN, "m1", "me", { text: "😂", at: 333 });
+  assert.deepEqual(store.getMessage(PN, "m1").reactions.me, { text: "😂", at: 333 });
+  store.setMessageReaction(PN, "m1", "me", null);
+  assert.deepEqual(store.getMessage(PN, "m1").reactions, {
+    "234@s.whatsapp.net": { text: "❤️", at: 222, name: "Ada" },
+  });
+
+  assert.equal(store.setMessageReaction(PN, "nope", "me", { text: "👍" }), null);
+  store.close();
+});
+
+test("system lines persist in raw_payload and surface on the view", () => {
+  const dir = tempDir();
+  const store = createSqliteMessageStore({ file: join(dir, "messages.db") });
+  store.save(
+    base({
+      id: "sys-1",
+      chat: "grp@g.us",
+      isGroup: true,
+      fromMe: false,
+      sender: "999@s.whatsapp.net",
+      text: "Alice added Bob",
+      raw: null,
+      system: {
+        action: "add",
+        actor: "999@s.whatsapp.net",
+        participants: ["555@s.whatsapp.net"],
+      },
+    })
+  );
+  const view = store.getMessage("grp@g.us", "sys-1");
+  assert.equal(view.text, "Alice added Bob");
+  assert.equal(view.fromMe, false);
+  assert.deepEqual(view.system, {
+    action: "add",
+    actor: "999@s.whatsapp.net",
+    participants: ["555@s.whatsapp.net"],
+  });
+  assert.equal(view.reactions, null, "no reactions yet");
+  store.close();
+});
+
+/* ------------------------------------------------------------------ */
+/*  Clear all data                                                     */
+/* ------------------------------------------------------------------ */
+
+test("clearAll empties every table", () => {
+  const dir = tempDir();
+  const file = join(dir, "messages.db");
+  const store = createSqliteMessageStore({ file });
+
+  // Seed at least one row in every table, including the join tables.
+  store.save(base({ id: "m1", chat: PN, raw: { key: { id: "m1", remoteJid: PN } } }));
+  store.setChatName(PN, "Ada");
+  const contact = store.createContact({ name: "Ada", phone: "2348011112222" });
+  store.saveTemplate({ id: "t1", title: "Welcome", body: "Hi" });
+  store.createList({ name: "Friends", contactIds: [contact.id] });
+  store.createBroadcast({
+    id: "b1",
+    templateId: "t1",
+    recipients: [{ phone: "2348011112222", name: "Ada" }],
+  });
+  store.saveGuardSettings("grp@g.us", { linkGuard: true });
+  store.logModeration({ jid: "grp@g.us", action: "warn" });
+  store.bumpStrike("grp@g.us", "999@s.whatsapp.net");
+  store.createAutoReply({ keyword: "hi", groups: ["grp@g.us"] });
+  store.saveAwaySettings({ enabled: true });
+  store.markAwayReply(PN, "2026-01-01T00:00");
+
+  const tables = [
+    "chats",
+    "chat_aliases",
+    "messages",
+    "templates",
+    "contacts",
+    "lists",
+    "list_contacts",
+    "broadcasts",
+    "broadcast_recipients",
+    "guard_settings",
+    "moderation_log",
+    "guard_strikes",
+    "auto_reply_rules",
+    "auto_reply_groups",
+    "away_settings",
+    "away_replies",
+  ];
+
+  assert.equal(store.clearAll(), tables.length);
+
+  // The public readers agree.
+  assert.deepEqual(store.listConversations(), []);
+  assert.deepEqual(store.listContacts(), []);
+  assert.deepEqual(store.listTemplates(), []);
+  assert.deepEqual(store.listBroadcasts(), []);
+  assert.deepEqual(store.listAutoReplies(), []);
+
+  // ...and every table is physically empty.
+  const db = open(file);
+  for (const table of tables) {
+    const { n } = db.prepare(`select count(*) as n from ${table}`).get();
+    assert.equal(n, 0, `${table} is empty`);
+  }
+  db.close();
   store.close();
 });

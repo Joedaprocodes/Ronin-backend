@@ -75,6 +75,58 @@ test("messages.upsert de-duplicates and extracts text", async () => {
   assert.equal(seen[1].text, "pic");
 });
 
+test("messages.upsert captures the quoted reply snapshot", async () => {
+  __reset();
+  const wa = new WhatsAppConnection({ auth: makeAuth() });
+  await wa.start();
+  await openConnection(wa);
+
+  const seen = [];
+  wa.on("message", (m) => seen.push(m));
+  __sockets().at(-1).ev.emit("messages.upsert", {
+    type: "notify",
+    messages: [
+      {
+        key: { id: "Q", remoteJid: "111@s.whatsapp.net", fromMe: false },
+        message: {
+          extendedTextMessage: {
+            text: "sure",
+            contextInfo: {
+              stanzaId: "ORIG",
+              participant: "111@s.whatsapp.net",
+              quotedMessage: { conversation: "are you there?" },
+            },
+          },
+        },
+      },
+    ],
+  });
+  await tick();
+  assert.equal(seen.length, 1);
+  assert.deepEqual(seen[0].quoted, {
+    id: "ORIG",
+    text: "are you there?",
+    sender: "111@s.whatsapp.net",
+    fromMe: false,
+  });
+});
+
+test("sendMessage snapshots an outgoing quoted reply", async () => {
+  __reset();
+  const wa = new WhatsAppConnection({ auth: makeAuth() });
+  await wa.start();
+  await openConnection(wa);
+
+  const target = {
+    key: { id: "ORIG", remoteJid: "111@s.whatsapp.net", fromMe: false },
+    message: { conversation: "original" },
+  };
+  const res = await wa.sendMessage("111@s.whatsapp.net", { text: "re" }, null, {
+    quoted: target,
+  });
+  assert.deepEqual(res.persisted.quoted, { id: "ORIG", text: "original" });
+});
+
 test("stop() ends the socket, waits, and reaches closed", async () => {
   __reset();
   const wa = new WhatsAppConnection({ auth: makeAuth() });
@@ -435,6 +487,465 @@ test("incoming media is downloaded, stored and persisted with the message", asyn
   assert.equal(m.media.fileName, null);
   // stub downloadMediaMessage returns `${kind}:${caption}`
   assert.deepEqual(readFileSync(join(dir, "in-media-1")), Buffer.from("imageMessage:pic!"));
+});
+
+test("incoming stickers are stored under the sticker bucket (not image)", async () => {
+  __reset();
+  const auth = makeAuth();
+  const dir = mkdtempSync(join(tmpdir(), "wa-media-"));
+  const saved = [];
+  const wa = new WhatsAppConnection({
+    auth,
+    messageStore: { save: async (m) => saved.push(m) },
+    mediaStore: createMediaStore({ dir }),
+  });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+
+  sock.ev.emit("messages.upsert", {
+    type: "notify",
+    messages: [
+      {
+        key: { id: "in-sticker-1", remoteJid: "123@s.whatsapp.net", fromMe: false },
+        pushName: "Ada",
+        message: { stickerMessage: { mimetype: "image/webp", url: "https://x/st" } },
+      },
+    ],
+  });
+  await waitFor(() => saved.length >= 1);
+  const m = saved[0];
+  assert.equal(m.id, "in-sticker-1");
+  assert.equal(m.media.type, "sticker");
+  assert.equal(m.media.mimeType, "image/webp");
+  // stub downloadMediaMessage returns `${kind}:${url}`
+  assert.deepEqual(readFileSync(join(dir, "in-sticker-1")), Buffer.from("stickerMessage:https://x/st"));
+});
+
+test("outgoing stickers persist under the sticker bucket", async () => {
+  __reset();
+  const auth = makeAuth();
+  const dir = mkdtempSync(join(tmpdir(), "wa-media-"));
+  const stored = [];
+  const wa = new WhatsAppConnection({
+    auth,
+    messageStore: { save: async (m) => stored.push(m) },
+    mediaStore: createMediaStore({ dir }),
+  });
+  await wa.start();
+  await openConnection(wa);
+
+  const bytes = Buffer.from("webpbytes");
+  const result = await wa.sendMessage("15551230000", {
+    sticker: bytes,
+    mimetype: "image/webp",
+  });
+  const ref = result.persisted.media;
+  assert.equal(ref.type, "sticker");
+  assert.equal(ref.mimeType, "image/webp");
+  assert.equal(result.persisted.text, null, "stickers carry no text");
+  assert.deepEqual(readFileSync(join(dir, ref.key)), bytes, "bytes on disk");
+});
+
+/** Minimal in-memory message store the connection's edit/revoke paths write to. */
+function makeMemoryStore() {
+  const rows = new Map();
+  return {
+    rows,
+    save: async (m) => {
+      if (rows.has(m.id)) return;
+      rows.set(m.id, {
+        id: m.id,
+        chat: m.chat,
+        fromMe: Boolean(m.fromMe),
+        sender: m.sender ?? null,
+        text: m.text ?? null,
+        tsMs: m.receivedAt ?? Date.now(),
+        deleted: false,
+        edited: false,
+        reactions: {},
+        system: m.system ?? m.raw?.system ?? null,
+        rawKey: m.rawKey ?? m.raw?.key ?? null,
+      });
+    },
+    markMessageDeleted: async (chat, id) => {
+      const row = rows.get(id);
+      if (row) row.deleted = true;
+      return Boolean(row);
+    },
+    updateMessageText: async (chat, id, text) => {
+      const row = rows.get(id);
+      if (row) {
+        row.text = text;
+        row.edited = true;
+      }
+      return Boolean(row);
+    },
+    setMessageReaction: async (chat, id, reactor, entry) => {
+      const row = rows.get(id);
+      if (!row) return null;
+      const next = { ...(row.reactions ?? {}) };
+      if (entry && entry.text) next[reactor] = entry;
+      else delete next[reactor];
+      row.reactions = next;
+      return next;
+    },
+    getMessageRaw: async (chat, id) => {
+      const row = rows.get(id);
+      if (!row) return null;
+      return {
+        id: row.id,
+        chat: row.chat,
+        fromMe: row.fromMe,
+        key: row.rawKey,
+        deleted: row.deleted,
+      };
+    },
+    getMessage: async (chat, id) => rows.get(id) ?? null,
+  };
+}
+
+test("deleteMessage/editMessage send the right Baileys content", async () => {
+  __reset();
+  const wa = new WhatsAppConnection({ auth: makeAuth() });
+  await wa.start();
+  await openConnection(wa);
+  const sock = __sockets().at(-1);
+
+  const key = { id: "m1", remoteJid: "123@s.whatsapp.net", fromMe: true };
+  await wa.deleteMessage("123@s.whatsapp.net", key);
+  await wa.editMessage("123@s.whatsapp.net", key, "new text");
+
+  assert.equal(sock.sent.length, 2);
+  assert.deepEqual(sock.sent[0].content, { delete: key });
+  assert.deepEqual(sock.sent[1].content, { text: "new text", edit: key });
+});
+
+test("editMessage rejects empty text and a missing key", async () => {
+  __reset();
+  const wa = new WhatsAppConnection({ auth: makeAuth() });
+  await wa.start();
+  await openConnection(wa);
+  await assert.rejects(() => wa.editMessage("123@s.whatsapp.net", { id: "m1" }, "   "), /empty/);
+  await assert.rejects(() => wa.editMessage("123@s.whatsapp.net", null, "hi"), /key/);
+});
+
+test("an incoming REVOKE protocol message tombstones the stored message", async () => {
+  __reset();
+  const store = makeMemoryStore();
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+  const updates = [];
+  wa.on("message:update", (m) => updates.push(m));
+
+  await store.save({ id: "m1", chat: "123@s.whatsapp.net", fromMe: false, sender: "123@s.whatsapp.net", text: "hi" });
+  store.rows.get("m1").tsMs = Date.now();
+
+  sock.ev.emit("messages.upsert", {
+    type: "notify",
+    messages: [
+      {
+        key: { id: "rev-1", remoteJid: "123@s.whatsapp.net", fromMe: false },
+        message: { protocolMessage: { type: 0, key: { id: "m1", remoteJid: "123@s.whatsapp.net" } } },
+      },
+    ],
+  });
+  await waitFor(() => store.rows.get("m1")?.deleted);
+  assert.equal(store.rows.get("m1").deleted, true, "flagged deleted");
+  assert.equal(store.rows.size, 1, "the protocol message itself was not stored");
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].id, "m1");
+  assert.equal(updates[0].deleted, true);
+});
+
+test("an incoming MESSAGE_EDIT protocol message updates the stored text", async () => {
+  __reset();
+  const store = makeMemoryStore();
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+  const updates = [];
+  wa.on("message:update", (m) => updates.push(m));
+
+  await store.save({ id: "m1", chat: "123@s.whatsapp.net", fromMe: false, sender: "123@s.whatsapp.net", text: "hi" });
+  store.rows.get("m1").tsMs = Date.now();
+
+  sock.ev.emit("messages.upsert", {
+    type: "notify",
+    messages: [
+      {
+        key: { id: "edit-1", remoteJid: "123@s.whatsapp.net", fromMe: false },
+        message: {
+          protocolMessage: {
+            type: 14,
+            key: { id: "m1", remoteJid: "123@s.whatsapp.net" },
+            editedMessage: { conversation: "edited text" },
+          },
+        },
+      },
+    ],
+  });
+  await waitFor(() => store.rows.get("m1")?.edited);
+  assert.equal(store.rows.get("m1").text, "edited text");
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].text, "edited text");
+  assert.equal(updates[0].edited, true);
+});
+
+test("a messages.update revoke (message: null) tombstones the stored message", async () => {
+  __reset();
+  const store = makeMemoryStore();
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+
+  await store.save({ id: "m1", chat: "123@s.whatsapp.net", fromMe: false, sender: "123@s.whatsapp.net", text: "hi" });
+  store.rows.get("m1").tsMs = Date.now();
+
+  sock.ev.emit("messages.update", [
+    { key: { id: "m1", remoteJid: "123@s.whatsapp.net" }, update: { message: null } },
+  ]);
+  await waitFor(() => store.rows.get("m1")?.deleted);
+  assert.equal(store.rows.get("m1").deleted, true);
+});
+
+test("messages.reaction stores and clears reactions without new traffic", async () => {
+  __reset();
+  const store = makeMemoryStore();
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+  const updates = [];
+  const messages = [];
+  wa.on("message:update", (m) => updates.push(m));
+  wa.on("message", (m) => messages.push(m));
+
+  await store.save({
+    id: "m1",
+    chat: "123@s.whatsapp.net",
+    fromMe: false,
+    sender: "123@s.whatsapp.net",
+    text: "hi",
+  });
+
+  sock.ev.emit("messages.reaction", [
+    {
+      key: { id: "m1", remoteJid: "123@s.whatsapp.net" },
+      reaction: {
+        text: "👍",
+        key: { remoteJid: "123@s.whatsapp.net", fromMe: false, id: "r1" },
+        senderTimestampMs: 111,
+      },
+    },
+  ]);
+  await waitFor(() => updates.length >= 1);
+  assert.deepEqual(store.rows.get("m1").reactions["123@s.whatsapp.net"], {
+    text: "👍",
+    at: 111,
+  });
+  assert.equal(updates[0].reactions["123@s.whatsapp.net"].text, "👍");
+
+  // An empty text removes that reactor's reaction again.
+  sock.ev.emit("messages.reaction", [
+    {
+      key: { id: "m1", remoteJid: "123@s.whatsapp.net" },
+      reaction: { text: "", key: { remoteJid: "123@s.whatsapp.net", fromMe: false, id: "r2" } },
+    },
+  ]);
+  await waitFor(() => updates.length >= 2);
+  assert.deepEqual(store.rows.get("m1").reactions, {});
+  assert.deepEqual(messages, [], "reactions never look like new messages");
+
+  // A reaction to a message we never stored is ignored (no crash, no row).
+  sock.ev.emit("messages.reaction", [
+    {
+      key: { id: "missing", remoteJid: "123@s.whatsapp.net" },
+      reaction: { text: "🔥", key: { remoteJid: "123@s.whatsapp.net", fromMe: false, id: "r3" } },
+    },
+  ]);
+  await tick();
+  assert.equal(store.rows.size, 1);
+  assert.equal(updates.length, 2);
+});
+
+test("a reactionMessage arriving via upsert is applied, not stored as a message", async () => {
+  __reset();
+  const store = makeMemoryStore();
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+  const updates = [];
+  wa.on("message:update", (m) => updates.push(m));
+
+  await store.save({
+    id: "m1",
+    chat: "123@s.whatsapp.net",
+    fromMe: false,
+    sender: "123@s.whatsapp.net",
+    text: "hi",
+  });
+
+  sock.ev.emit("messages.upsert", {
+    type: "notify",
+    messages: [
+      {
+        key: { id: "react-msg-1", remoteJid: "123@s.whatsapp.net", fromMe: false },
+        message: {
+          reactionMessage: {
+            key: { id: "m1", remoteJid: "123@s.whatsapp.net" },
+            text: "🎉",
+          },
+        },
+      },
+    ],
+  });
+  await waitFor(() => updates.length >= 1);
+  assert.equal(store.rows.get("m1").reactions["123@s.whatsapp.net"].text, "🎉");
+  assert.equal(store.rows.size, 1, "the reaction never becomes its own message row");
+});
+
+test("sendReaction sends the Baileys react payload and writes it to the store", async () => {
+  __reset();
+  const store = makeMemoryStore();
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  await openConnection(wa);
+  const sock = __sockets().at(-1);
+
+  await store.save({
+    id: "m1",
+    chat: "123@s.whatsapp.net",
+    fromMe: false,
+    sender: "123@s.whatsapp.net",
+    text: "hi",
+    raw: { key: { id: "m1", remoteJid: "123@s.whatsapp.net", fromMe: false } },
+  });
+
+  await wa.sendReaction("123@s.whatsapp.net", "m1", "❤️");
+  assert.equal(sock.sent.length, 1);
+  assert.deepEqual(sock.sent[0].content, {
+    react: { text: "❤️", key: { id: "m1", remoteJid: "123@s.whatsapp.net", fromMe: false } },
+  });
+  assert.equal(store.rows.get("m1").reactions.me.text, "❤️");
+
+  // Clearing sends an empty text and drops our entry.
+  await wa.sendReaction("123@s.whatsapp.net", "m1", "");
+  assert.deepEqual(sock.sent[1].content.react.text, "");
+  assert.deepEqual(store.rows.get("m1").reactions, {});
+
+  await assert.rejects(() => wa.sendReaction("123@s.whatsapp.net", "nope", "👍"), /not found/);
+});
+
+test("group-participants.update becomes a persisted system line", async () => {
+  __reset();
+  const store = makeMemoryStore();
+  store.resolveChatName = async (jid) => (jid === "999@s.whatsapp.net" ? "Alice" : null);
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+  const updates = [];
+  const messages = [];
+  wa.on("message:update", (m) => updates.push(m));
+  wa.on("message", (m) => messages.push(m));
+
+  sock.ev.emit("group-participants.update", {
+    id: "grp@g.us",
+    author: "999@s.whatsapp.net",
+    participants: [
+      { id: "555@s.whatsapp.net", notify: "Bob" },
+      { id: "666@s.whatsapp.net", notify: "Carol" },
+    ],
+    action: "add",
+  });
+
+  await waitFor(() => updates.length >= 1);
+  const row = [...store.rows.values()].find((r) => r.system);
+  assert.ok(row, "system row stored");
+  assert.equal(row.chat, "grp@g.us");
+  assert.equal(row.fromMe, false);
+  assert.equal(row.text, "Alice added Bob and Carol");
+  assert.deepEqual(row.system, {
+    action: "add",
+    actor: "999@s.whatsapp.net",
+    participants: ["555@s.whatsapp.net", "666@s.whatsapp.net"],
+  });
+  assert.equal(updates[0].system.action, "add");
+  assert.equal(store.rows.size, 1);
+  // Never announced as new traffic, so auto-replies/guards ignore it.
+  assert.deepEqual(messages, []);
+});
+
+test("membership lines phrase remove, leave, promote and demote correctly", async () => {
+  __reset();
+  const store = makeMemoryStore();
+  const wa = new WhatsAppConnection({ auth: makeAuth(), messageStore: store });
+  await wa.start();
+  const sock = __sockets().at(-1);
+  await openConnection(wa);
+  const updates = [];
+  wa.on("message:update", (m) => updates.push(m));
+
+  const emit = (update) => sock.ev.emit("group-participants.update", update);
+  const waitForCount = (n) => waitFor(() => updates.length >= n);
+
+  emit({
+    id: "grp@g.us",
+    author: "999@s.whatsapp.net",
+    authorUsername: "alice",
+    participants: [{ id: "555@s.whatsapp.net", notify: "Bob" }],
+    action: "remove",
+  });
+  await waitForCount(1);
+
+  emit({
+    id: "grp@g.us",
+    author: "1234@s.whatsapp.net",
+    participants: [{ id: "666@s.whatsapp.net", notify: "Carol" }],
+    action: "remove",
+  });
+  await waitForCount(2);
+
+  emit({
+    id: "grp@g.us",
+    author: "555@s.whatsapp.net",
+    participants: [{ id: "555@s.whatsapp.net", notify: "Bob" }],
+    action: "remove",
+  });
+  await waitForCount(3);
+
+  emit({
+    id: "grp@g.us",
+    author: "1234@s.whatsapp.net",
+    participants: [{ id: "777@s.whatsapp.net", notify: "Dan" }],
+    action: "promote",
+  });
+  await waitForCount(4);
+
+  emit({
+    id: "grp@g.us",
+    author: "1234@s.whatsapp.net",
+    participants: [{ id: "777@s.whatsapp.net", notify: "Dan" }],
+    action: "demote",
+  });
+  await waitForCount(5);
+
+  assert.deepEqual(
+    updates.map((u) => u.text),
+    [
+      "alice removed Bob",
+      "You removed Carol",
+      "Bob left",
+      "You promoted Dan to admin",
+      "You demoted Dan",
+    ]
+  );
 });
 
 test("a failed media download never drops the message (media stays null)", async () => {

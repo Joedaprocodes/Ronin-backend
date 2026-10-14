@@ -16,8 +16,10 @@ import {
   validateAwaySettings,
 } from "../db/automation.js";
 import { canonicalId } from "../whatsapp/identity.js";
+import { PAIRING_CODE_TTL_MS } from "../whatsapp/utils.js";
 
 const MAX_TEXT_LENGTH = 4096; // WhatsApp text limit
+const MAX_REACTION_LENGTH = 32; // an emoji plus room for a flag/ZWJ sequence
 const MAX_TITLE_LENGTH = 200; // template titles / fallback names
 const MAX_IMPORT_CONTACTS = 5000; // POST /api/contacts/import row cap
 const MAX_BROADCAST_LISTS = 100; // POST /api/broadcasts/send list id cap
@@ -120,7 +122,8 @@ const EVENT_HEADERS = {
  * they are interchangeable. Note: the top-level `id` in the send response is the
  * *message* id, not the jid.
  *
- * Endpoints (base URL http://localhost:${API_PORT}.):
+ * Endpoints (base URL http://localhost:${apiPort}, where apiPort is
+ * PORT ?? API_PORT ?? 3001; see createApiServer's caller in src/index.js.):
  *   GET  /api/inbox?q=...                    -> { conversations: [...] } — lightweight:
  *                                              each conversation carries today's meta
  *                                              (id, jid, name, isGroup, unread, flagged,
@@ -143,7 +146,16 @@ const EVENT_HEADERS = {
  *                                              returns 400.
  *   POST /api/inbox/:jid/read              -> { ok, jid, unread: 0 }
  *   POST /api/inbox/:jid/flag              -> body { flagged: bool }  -> { ok, jid, flagged }
- *   POST /api/inbox/:jid/send              -> send a text and/or a media message
+ *   POST /api/inbox/:jid/send              -> send a text and/or a media
+ *                                              message; optional `quotedId`
+ *                                              makes it a reply
+ *   PUT  /api/inbox/:jid/messages/:id      -> body { text } — edit one of our
+ *                                              messages -> { ok, message }
+ *   DELETE /api/inbox/:jid/messages/:id    -> revoke one of our messages
+ *                                              -> { ok, message } (tombstoned)
+ *   POST /api/inbox/:jid/messages/:id/reaction -> body { text } — add our
+ *                                              reaction (empty text clears it)
+ *                                              -> { ok, message }
  *   GET  /api/events                       -> Server-Sent-Events stream of messages
  *   GET  /api/groups/:jid                  -> { group } — live group details:
  *                                              subject, description, owner,
@@ -194,8 +206,34 @@ const EVENT_HEADERS = {
  *                                              state is "open", and `user` = { id, name }
  *                                              (the account jid + WhatsApp profile name)
  *                                              once a socket has opened, null otherwise. The
- *                                              QR / pairing code are deliberately NOT exposed.
+ *                                              QR is deliberately NOT exposed; a pairing code
+ *                                              is only returned on demand (see below).
  *                                              Returns 503 when no connection is configured.
+ *   POST /api/account/disconnect           -> { ok, connected: false, state } — unlink the
+ *                                              linked device: logs the session out, wipes the
+ *                                              stored credentials, then relinks (a fresh QR /
+ *                                              pairing code). Idempotent; offline it just
+ *                                              clears the stored session. Needs x-api-token
+ *                                              when configured; 503 no connection, 502 if the
+ *                                              connection can't log out.
+ *                                              connection can't log out.
+ *   POST /api/account/clear-data           -> { ok, mediaRemoved } — permanently
+ *                                              delete every row of app data
+ *                                              (messages, chats, contacts, lists,
+ *                                              templates, broadcasts, guards,
+ *                                              automation) and the stored media
+ *                                              bytes. Keeps the WhatsApp session
+ *                                              linked. Needs x-api-token when
+ *                                              configured; 503 no store, 502 if
+ *                                              the store can't clear.
+ *   POST /api/account/pair                 -> { ok, code, expiresInMs } — request an
+ *                                              8-character pairing code (e.g. "ABCD-EFGH")
+ *                                              to link a phone. Body { phoneNumber? };
+ *                                              falls back to the configured PHONE_NUMBER.
+ *                                              Needs x-api-token when configured; 400 when
+ *                                              no number is available / the number is bad,
+ *                                              409 when the session isn't in "qr" yet
+ *                                              (retry shortly after disconnecting).
  *   GET  /api/media/:messageId             -> raw stored media bytes
  *   GET  /api/templates                    -> { templates: [...] } — broadcast
  *                                              templates (like saved messages),
@@ -279,24 +317,28 @@ const EVENT_HEADERS = {
  * as-is.
  *
  * Send body:
- *   { text?, email?, media?: { type, data, mimeType?, fileName?, caption? } }
+ *   { text?, email?, media?: { type, data, mimeType?, fileName?, caption? },
+ *     quotedId? }
  *   type: "image" | "video" | "audio" | "document"; data is base64 or a data: URL.
  *   At least text or media is required; document requires fileName + mimeType.
+ *   `quotedId` is the id of a stored message in this chat; it turns the send
+ *   into a WhatsApp quoted reply (404 unknown id, 409 deleted/unusable).
  *   Responses: 200 { ok, jid, id, message } | 400 invalid | 401 token | 409 not
  *   connected | 413 media too large | 422 not on WhatsApp | 502 send failed.
  *   `message` mirrors the thread shape ({ id, from: "me", text, time, sender?,
  *   media? }) and is the persisted message a reload will show.
  *
- * Media: outgoing media bytes are persisted to the media store
- * (src/media/store.js, MEDIA_DIR default ./data/media) at send time; incoming
- * media is downloaded and stored the same way. Message rows keep a media ref
+ * Media: outgoing media bytes are persisted to the media store at send time;
+ * incoming media is downloaded and stored the same way. Development uses the
+ * on-disk store (src/media/store.js, MEDIA_DIR default ./data/media); production
+ * uses a Supabase Storage bucket (src/media/supabase.js, set SUPABASE_URL +
+ * SUPABASE_SERVICE_ROLE_KEY). Message rows keep a media ref
  * { key, type, mimeType, fileName } and message views carry
- * `media: { type, mimeType, fileName, url }` (url = /api/media/<key>) when the
- * message is a media one (omitted otherwise). GET /api/media/:messageId serves
- * the bytes with the right Content-Type plus an `inline` Content-Disposition
- * carrying the file name for documents. Note: <img src> / <a href> can't set
- * request headers, so this route stays open like the other reads (localhost);
- * if the GETs get locked down later, accept ?token= here just like /api/events.
+ * `media: { type, mimeType, fileName, url }` — the Supabase public URL when the
+ * bucket is in use, otherwise /api/media/<key> when the message is a media one
+ * (omitted otherwise). GET /api/media/:messageId still serves the bytes from
+ * whatever store is configured (the disk path is what refs written before the
+ * bucket existed point at).
  *
  * Templates: a template is created "like a message" — `title` (required,
  * trimmed, max 200 chars) + `body` text (max 4096) and/or one `media`
@@ -345,9 +387,11 @@ const EVENT_HEADERS = {
  *                  "message" event for the SSE stream. When null, send and
  *                  /api/account return 503.
  * @param {object}  [params.mediaStore]    media store exposing read(key) ->
- *                  { buffer, mimeType, fileName } | null (see src/media/store.js);
- *                  backs GET /api/media/:messageId; also stores template
- *                  attachments at save time.
+ *                  { buffer, mimeType, fileName } | null, save(...) and
+ *                  clearAll() (see src/media/store.js for the on-disk store and
+ *                  src/media/supabase.js for the production bucket); backs
+ *                  GET /api/media/:messageId; also stores template attachments
+ *                  at save time.
  * @param {object}  [params.templateStore] store exposing listTemplates(),
  *                  getTemplate(id), saveTemplate({...}), updateTemplate(id, {...}),
  *                  deleteTemplate(id). Defaults to `messageStore` — the backend
@@ -508,10 +552,24 @@ export function createApiServer({
     };
     connection?.on?.("guard", onGuard);
 
+    // Edits/revokes arrive as their own event (never confused with new traffic
+    // by the auto-reply/guards engines) but still refresh the open thread.
+    const onMessageUpdate = (msg) => {
+      if (filterJid && msg.chat !== filterJid) return;
+      const frame = JSON.stringify({ jid: msg.chat, message: toMessageView(msg, msg.isGroup ?? false) });
+      try {
+        res.write(`data: ${frame}\n\n`);
+      } catch {
+        // connection dying; cleanup handles the rest
+      }
+    };
+    connection?.on?.("message:update", onMessageUpdate);
+
     const cleanup = () => {
       clearInterval(heartbeat);
       connection?.off?.("message", onMessage);
       connection?.off?.("guard", onGuard);
+      connection?.off?.("message:update", onMessageUpdate);
     };
     req.on("close", cleanup);
     req.on("error", cleanup);
@@ -528,7 +586,7 @@ export function createApiServer({
       return sendJson(res, 409, { error: "WhatsApp is not connected" });
     }
 
-    const { text, email, media } = body ?? {};
+    const { text, email, media, quotedId } = body ?? {};
     const hasText = typeof text === "string" && text.trim().length > 0;
     const hasMedia = Boolean(media && typeof media.data === "string" && media.data.trim().length > 0);
     if (!hasText && !hasMedia) return sendJson(res, 400, { error: "text or media.data is required" });
@@ -537,6 +595,22 @@ export function createApiServer({
     }
     if (email != null && typeof email !== "string") {
       return sendJson(res, 400, { error: "email must be a string" });
+    }
+    if (quotedId != null && typeof quotedId !== "string") {
+      return sendJson(res, 400, { error: "quotedId must be a string" });
+    }
+
+    // A quoted reply: rebuild the `{ key, message }` target Baileys needs from
+    // the stored row so the send carries WhatsApp's reply context.
+    let quoted = null;
+    if (quotedId) {
+      const target = await messageStore.getMessageRaw(jid, quotedId);
+      if (!target) return sendJson(res, 404, { error: "quoted message not found" });
+      if (target.deleted) return sendJson(res, 409, { error: "quoted message was deleted" });
+      if (!target.key?.id || !target.message) {
+        return sendJson(res, 409, { error: "quoted message cannot be used" });
+      }
+      quoted = { key: target.key, message: target.message };
     }
 
     let content = {};
@@ -564,14 +638,22 @@ export function createApiServer({
       }
 
       const caption = media.caption ?? (type === "image" || type === "video" ? text : undefined);
+      // Baileys builds a sticker from `{ sticker: buffer }` — which `content[type]`
+      // produces for type "sticker" — and wants a webp mimetype.
       if (media.mimeType) content.mimetype = media.mimeType;
+      else if (type === "sticker") content.mimetype = "image/webp";
       content[type] = buf;
       if (type === "document") content.fileName = media.fileName;
       if ((type === "image" || type === "video") && caption) content.caption = caption;
     }
 
     try {
-      const result = await connection.sendMessage(jid, content, email ?? null);
+      const result = await connection.sendMessage(
+        jid,
+        content,
+        email ?? null,
+        quoted ? { quoted } : undefined
+      );
       const id = result?.key?.id ?? null;
       // Prefer the persisted message the connection wrote (so `time` and `media`
       // match a reload) and fall back for bare/fake connections.
@@ -583,6 +665,119 @@ export function createApiServer({
       const msg = String(err?.message ?? "send failed");
       return sendJson(res, /is not on WhatsApp/.test(msg) ? 422 : 502, { error: msg });
     }
+  }
+
+  /**
+   * Loads a stored message for an edit/delete action, enforcing that it exists
+   * and is ours — WhatsApp only lets you edit or revoke your own messages.
+   * Returns the raw row ({ key, fromMe }) or writes an error and returns null.
+   */
+  async function loadOwnMessage(res, jid, id) {
+    const raw = await messageStore.getMessageRaw(jid, id);
+    if (!raw) {
+      sendJson(res, 404, { error: "message not found" });
+      return null;
+    }
+    if (!raw.fromMe) {
+      sendJson(res, 403, { error: "you can only edit or delete your own messages" });
+      return null;
+    }
+    if (!raw.key?.id) {
+      sendJson(res, 409, { error: "message cannot be changed (missing key)" });
+      return null;
+    }
+    return raw;
+  }
+
+  /**
+   * The API view of a just-changed message, and a push of the same row over SSE
+   * so every open thread re-renders it live.
+   */
+  async function messageUpdateFrame(jid, id) {
+    const view = await messageStore.getMessage(jid, id);
+    if (!view) return null;
+    const isGroup = jid.endsWith("@g.us");
+    connection?.emit?.("message:update", { ...view, isGroup });
+    return toMessageView(view, isGroup);
+  }
+
+  /** DELETE /api/inbox/:jid/messages/:id — revoke one of our messages. */
+  async function handleDeleteMessage(req, res, jid, id) {
+    if (apiToken && !tokenMatches(req.headers["x-api-token"], apiToken)) {
+      return sendJson(res, 401, { error: "unauthorized" });
+    }
+    if (!connection) return sendJson(res, 503, { error: "no WhatsApp connection" });
+    if (connection.getStatus?.().state !== "open") {
+      return sendJson(res, 409, { error: "WhatsApp is not connected" });
+    }
+    const raw = await loadOwnMessage(res, jid, id);
+    if (!raw) return;
+    try {
+      await connection.deleteMessage(jid, raw.key);
+    } catch (err) {
+      return sendJson(res, 502, { error: String(err?.message ?? "delete failed") });
+    }
+    await messageStore.markMessageDeleted(jid, id);
+    const message = await messageUpdateFrame(jid, id);
+    return sendJson(res, 200, { ok: true, jid, id, message });
+  }
+
+  /** PUT /api/inbox/:jid/messages/:id — edit the text of one of our messages. */
+  async function handleEditMessage(req, res, jid, id, body) {
+    if (apiToken && !tokenMatches(req.headers["x-api-token"], apiToken)) {
+      return sendJson(res, 401, { error: "unauthorized" });
+    }
+    if (!connection) return sendJson(res, 503, { error: "no WhatsApp connection" });
+    if (connection.getStatus?.().state !== "open") {
+      return sendJson(res, 409, { error: "WhatsApp is not connected" });
+    }
+    const text = typeof body?.text === "string" ? body.text : "";
+    if (!text.trim()) return sendJson(res, 400, { error: "text is required" });
+    if (text.length > MAX_TEXT_LENGTH) {
+      return sendJson(res, 400, { error: `text is too long (max ${MAX_TEXT_LENGTH} characters)` });
+    }
+    const raw = await loadOwnMessage(res, jid, id);
+    if (!raw) return;
+    try {
+      await connection.editMessage(jid, raw.key, text);
+    } catch (err) {
+      return sendJson(res, 502, { error: String(err?.message ?? "edit failed") });
+    }
+    await messageStore.updateMessageText(jid, id, text);
+    const message = await messageUpdateFrame(jid, id);
+    return sendJson(res, 200, { ok: true, jid, id, message });
+  }
+
+  /**
+   * POST /api/inbox/:jid/messages/:id/reaction — add our reaction to a stored
+   * message (`{ text }`; an empty text clears it). Unlike edit/delete this works
+   * on anyone's message, matching WhatsApp.
+   */
+  async function handleReaction(req, res, jid, id, body) {
+    if (apiToken && !tokenMatches(req.headers["x-api-token"], apiToken)) {
+      return sendJson(res, 401, { error: "unauthorized" });
+    }
+    if (!connection) return sendJson(res, 503, { error: "no WhatsApp connection" });
+    if (connection.getStatus?.().state !== "open") {
+      return sendJson(res, 409, { error: "WhatsApp is not connected" });
+    }
+    const text = typeof body?.text === "string" ? body.text.trim() : "";
+    if (text.length > MAX_REACTION_LENGTH) {
+      return sendJson(res, 400, {
+        error: `reaction is too long (max ${MAX_REACTION_LENGTH} characters)`,
+      });
+    }
+    const raw = await messageStore.getMessageRaw(jid, id);
+    if (!raw) return sendJson(res, 404, { error: "message not found" });
+    if (raw.deleted) return sendJson(res, 409, { error: "message was deleted" });
+    if (!raw.key?.id) return sendJson(res, 409, { error: "message cannot be reacted to" });
+    try {
+      await connection.sendReaction(jid, id, text);
+    } catch (err) {
+      return sendJson(res, 502, { error: String(err?.message ?? "reaction failed") });
+    }
+    const message = await messageUpdateFrame(jid, id);
+    return sendJson(res, 200, { ok: true, jid, id, message });
   }
 
   /**
@@ -1165,6 +1360,79 @@ export function createApiServer({
         });
       }
 
+      // Wipe every row of app data (messages, chats, contacts, templates,
+      // broadcasts, guards, automation) plus the on-disk media bytes. Token
+      // gated like the other writes. Deliberately does NOT need a connection:
+      // it's a database sweep, and the WhatsApp session is left linked.
+      if (req.method === "POST" && path === "/api/account/clear-data") {
+        if (apiToken && !tokenMatches(req.headers["x-api-token"], apiToken)) {
+          return sendJson(res, 401, { error: "unauthorized" });
+        }
+        if (!messageStore) return sendJson(res, 503, { error: "no message store" });
+        if (typeof messageStore.clearAll !== "function") {
+          return sendJson(res, 502, { error: "clearing data is not supported" });
+        }
+        await messageStore.clearAll();
+        let mediaRemoved = 0;
+        if (typeof mediaStore?.clearAll === "function") {
+          mediaRemoved = await mediaStore.clearAll();
+        }
+        return sendJson(res, 200, { ok: true, mediaRemoved });
+      }
+
+      // Disconnect (unlink) the current session, or request a fresh 8-character
+      // pairing code to link one. Both are writes, so they're token-gated like
+      // the send/automation routes; neither needs the message store.
+      if (
+        req.method === "POST" &&
+        (path === "/api/account/disconnect" || path === "/api/account/pair")
+      ) {
+        if (apiToken && !tokenMatches(req.headers["x-api-token"], apiToken)) {
+          return sendJson(res, 401, { error: "unauthorized" });
+        }
+        if (!connection) return sendJson(res, 503, { error: "no WhatsApp connection" });
+
+        if (path === "/api/account/disconnect") {
+          if (typeof connection.logout !== "function") {
+            return sendJson(res, 502, { error: "disconnect is not supported" });
+          }
+          // Unlinks the phone, wipes the stored session, then relinks (a fresh
+          // QR / pairing code). Idempotent: offline it just clears the session.
+          await connection.logout();
+          const status = connection.getStatus?.() ?? {};
+          return sendJson(res, 200, {
+            ok: true,
+            connected: false,
+            state: status.state ?? "unknown",
+          });
+        }
+
+        // POST /api/account/pair — request an 8-character pairing code.
+        if (typeof connection.pair !== "function") {
+          return sendJson(res, 502, { error: "pairing is not supported" });
+        }
+        const status = connection.getStatus?.() ?? {};
+        if (status.state !== "qr") {
+          // The session is still tearing down / reconnecting; retry shortly.
+          return sendJson(res, 409, { error: "not ready to pair yet" });
+        }
+        const body = await readJson(req, res);
+        if (body === undefined) return;
+        const phoneNumber = body?.phoneNumber ?? connection.phoneNumber ?? null;
+        if (!phoneNumber) {
+          return sendJson(res, 400, { error: "phoneNumber is required" });
+        }
+        let code;
+        try {
+          code = await connection.pair(phoneNumber);
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err?.message || "could not request a pairing code",
+          });
+        }
+        return sendJson(res, 200, { ok: true, code, expiresInMs: PAIRING_CODE_TTL_MS });
+      }
+
       // Media bytes live in the media store (not the message store), so this
       // route stays available even when message persistence isn't configured.
       const mediaMatch = path.match(/^\/api\/media\/([^/]+)$/);
@@ -1606,6 +1874,35 @@ export function createApiServer({
           return sendJson(res, 400, { error: "invalid JSON body" });
         }
         return handleSend(req, res, jid, body);
+      }
+
+      // React (POST { text }) to a single stored message.
+      const reactionMatch = path.match(/^\/api\/inbox\/([^/]+)\/messages\/([^/]+)\/reaction$/);
+      if (reactionMatch && req.method === "POST") {
+        const jid = await resolveInboxJid(decodeURIComponent(reactionMatch[1]));
+        const id = decodeURIComponent(reactionMatch[2]);
+        let body;
+        try {
+          body = await readBody(req);
+        } catch {
+          return sendJson(res, 400, { error: "invalid JSON body" });
+        }
+        return handleReaction(req, res, jid, id, body);
+      }
+
+      // Edit (PUT { text }) / delete (DELETE) a single stored message.
+      const messageMatch = path.match(/^\/api\/inbox\/([^/]+)\/messages\/([^/]+)$/);
+      if (messageMatch && (req.method === "DELETE" || req.method === "PUT")) {
+        const jid = await resolveInboxJid(decodeURIComponent(messageMatch[1]));
+        const id = decodeURIComponent(messageMatch[2]);
+        if (req.method === "DELETE") return handleDeleteMessage(req, res, jid, id);
+        let body;
+        try {
+          body = await readBody(req);
+        } catch {
+          return sendJson(res, 400, { error: "invalid JSON body" });
+        }
+        return handleEditMessage(req, res, jid, id, body);
       }
 
       // Group info is a live WhatsApp read (token-free GET, same posture as

@@ -85,7 +85,11 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
       sender_jid   text,
       content      text,
       media        text,
+      quoted       text,
       sender_email text,
+      deleted      integer not null default 0,
+      edited       integer not null default 0,
+      reactions    text,
       timestamp    text    default (datetime('now')),
       raw_payload  text
     );
@@ -225,6 +229,14 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
   if (!chatColumns.includes("username")) db.exec("alter table chats add column username text");
   const messageColumns = db.prepare("pragma table_info(messages)").all().map((c) => c.name);
   if (!messageColumns.includes("media")) db.exec("alter table messages add column media text");
+  if (!messageColumns.includes("quoted")) db.exec("alter table messages add column quoted text");
+  if (!messageColumns.includes("deleted")) {
+    db.exec("alter table messages add column deleted integer not null default 0");
+  }
+  if (!messageColumns.includes("edited")) {
+    db.exec("alter table messages add column edited integer not null default 0");
+  }
+  if (!messageColumns.includes("reactions")) db.exec("alter table messages add column reactions text");
   const templateColumns = db.prepare("pragma table_info(templates)").all().map((c) => c.name);
   if (!templateColumns.includes("fallback_name")) {
     db.exec("alter table templates add column fallback_name text");
@@ -248,14 +260,14 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
   `);
   const insertMessage = db.prepare(`
     insert or ignore into messages
-      (id, chat_jid, from_me, sender_jid, content, media, sender_email, timestamp, raw_payload)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (id, chat_jid, from_me, sender_jid, content, media, quoted, sender_email, timestamp, raw_payload)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const selectMessages = db.prepare(
-    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media from messages"
+    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages"
   );
   const selectMessagesOf = db.prepare(
-    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media from messages where chat_jid = ?"
+    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages where chat_jid = ?"
   );
   const selectChats = db.prepare("select jid, name, is_group, flagged, read_at from chats");
   const selectChat = db.prepare("select jid, name, is_group, flagged, read_at from chats where jid = ?");
@@ -280,24 +292,39 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
   const deleteChatRow = db.prepare("delete from chats where jid = ?");
   const selectRawPayloads = db.prepare("select chat_jid, raw_payload from messages where raw_payload is not null");
   const selectNewest = db.prepare(
-    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media from messages where chat_jid = ? order by timestamp desc, id desc limit 1"
+    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages where chat_jid = ? order by timestamp desc, id desc limit 1"
   );
   const selectNewestThem = db.prepare(
-    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media from messages where chat_jid = ? and from_me = 0 order by timestamp desc, id desc limit 1"
+    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages where chat_jid = ? and from_me = 0 order by timestamp desc, id desc limit 1"
   );
   const selectPageFirst = db.prepare(
-    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media from messages where chat_jid = ? order by timestamp desc, id desc limit ?"
+    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages where chat_jid = ? order by timestamp desc, id desc limit ?"
   );
   // SQLite has no row-value comparison, so the keyset predicate is expanded
   // into the equivalent pair of conditions (same semantics as the Postgres
   // store's `(timestamp, id) < (?, ?)`).
   const selectPageBefore = db.prepare(`
-    select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media
+    select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions
     from messages
     where chat_jid = ? and (timestamp < ? or (timestamp = ? and id < ?))
     order by timestamp desc, id desc
     limit ?
   `);
+  // Single-message lookup + the two mutations delete/edit need. Deleting keeps
+  // the row's content (only the `deleted` flag flips) so an admin can still
+  // reveal what was removed.
+  const selectMessage = db.prepare(
+    "select id, chat_jid, from_me, sender_jid, content, timestamp, raw_payload, media, quoted, deleted, edited, reactions from messages where chat_jid = ? and id = ?"
+  );
+  const markMessageDeletedStmt = db.prepare(
+    "update messages set deleted = 1 where chat_jid = ? and id = ?"
+  );
+  const updateMessageTextStmt = db.prepare(
+    "update messages set content = ?, edited = 1 where chat_jid = ? and id = ?"
+  );
+  const updateMessageReactionsStmt = db.prepare(
+    "update messages set reactions = ? where chat_jid = ? and id = ?"
+  );
   const countUnreadAll = db.prepare(
     "select count(*) as c from messages where chat_jid = ? and from_me = 0"
   );
@@ -499,6 +526,22 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
         media = null; // corrupt sidecar data: treat as no media
       }
     }
+    let quoted = null;
+    if (row.quoted) {
+      try {
+        quoted = JSON.parse(row.quoted);
+      } catch {
+        quoted = null; // corrupt sidecar data: treat as no quote
+      }
+    }
+    let reactions = null;
+    if (row.reactions) {
+      try {
+        reactions = JSON.parse(row.reactions);
+      } catch {
+        reactions = null; // corrupt sidecar data: treat as no reactions
+      }
+    }
     return {
       id: row.id,
       chat: row.chat_jid,
@@ -507,12 +550,17 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
       text: row.content ?? null,
       tsMs: row.timestamp ? new Date(row.timestamp).getTime() : 0,
       pushName: raw?.pushName ?? null,
+      quoted: quoted ?? null,
+      deleted: Boolean(row.deleted),
+      edited: Boolean(row.edited),
+      reactions,
+      system: raw?.system ?? null,
       media: media
         ? {
             type: media.type ?? null,
             mimeType: media.mimeType ?? null,
             fileName: media.fileName ?? null,
-            url: `/api/media/${media.key}`,
+            url: media.url ?? `/api/media/${media.key}`,
           }
         : null,
     };
@@ -533,9 +581,16 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
 
   function save(message) {
     const timestamp = new Date(message.receivedAt ?? Date.now()).toISOString();
-    const rawJson =
-      message.raw == null ? null : JSON.stringify(message.raw, BufferJSON.replacer);
+    const rawPayload =
+      message.raw == null && !message.system
+        ? null
+        : {
+            ...(message.raw ?? {}),
+            ...(message.system ? { system: message.system } : {}),
+          };
+    const rawJson = rawPayload == null ? null : JSON.stringify(rawPayload, BufferJSON.replacer);
     const media = message.media ?? null;
+    const quoted = message.quoted ?? null;
 
     // The chat row must exist before the message row (FK), so write both in the
     // same transaction, chat first — same semantics as the Postgres store.
@@ -549,6 +604,7 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
         message.sender ?? null,
         message.text ?? null,
         media ? JSON.stringify(media) : null,
+        quoted ? JSON.stringify(quoted) : null,
         message.senderEmail ?? null,
         timestamp,
         rawJson
@@ -558,6 +614,74 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
       db.exec("rollback");
       throw err;
     }
+  }
+
+  /** One stored message as a view (with its deleted/edited flags), or null. */
+  function getMessage(chat, id) {
+    const row = selectMessage.get(chat, id);
+    return row ? toMessageView(row) : null;
+  }
+
+  /**
+   * The Baileys key stored for a message (needed to edit/revoke it on
+   * WhatsApp) and the raw content (needed to quote it in a reply), plus whether
+   * it was ours. Null when the row is unknown.
+   */
+  function getMessageRaw(chat, id) {
+    const row = selectMessage.get(chat, id);
+    if (!row) return null;
+    let raw = null;
+    try {
+      raw = row.raw_payload ? JSON.parse(row.raw_payload) : null;
+    } catch {
+      raw = null; // corrupt payload: no key to reuse
+    }
+    return {
+      id: row.id,
+      chat: row.chat_jid,
+      fromMe: Boolean(row.from_me),
+      key: raw?.key ?? null,
+      message: raw?.message ?? null,
+      deleted: Boolean(row.deleted),
+    };
+  }
+
+  /** Flags a message deleted; returns whether a row changed. */
+  function markMessageDeleted(chat, id) {
+    return markMessageDeletedStmt.run(chat, id).changes > 0;
+  }
+
+  /** Replaces a message's text and flags it edited; returns whether it changed. */
+  function updateMessageText(chat, id, text) {
+    return updateMessageTextStmt.run(text ?? null, chat, id).changes > 0;
+  }
+
+  /**
+   * Sets (or, with `entry = null`, removes) one reactor's reaction on a
+   * message. Reactions live in a JSON sidecar keyed by reactor ("me" or a bare
+   * jid), so each person has at most one per message and the latest write wins.
+   * Returns the updated map, or null when the message is unknown.
+   */
+  function setMessageReaction(chat, id, reactor, entry) {
+    const row = selectMessage.get(chat, id);
+    if (!row) return null;
+    let reactions = null;
+    if (row.reactions) {
+      try {
+        reactions = JSON.parse(row.reactions);
+      } catch {
+        reactions = null; // corrupt sidecar data: rebuild from scratch
+      }
+    }
+    const next = { ...(reactions ?? {}) };
+    if (entry && entry.text) next[reactor] = entry;
+    else delete next[reactor];
+    updateMessageReactionsStmt.run(
+      Object.keys(next).length ? JSON.stringify(next) : null,
+      chat,
+      id
+    );
+    return next;
   }
 
   function listConversations(q = null) {
@@ -797,7 +921,7 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
             type: media.type ?? null,
             mimeType: media.mimeType ?? null,
             fileName: media.fileName ?? null,
-            url: `/api/media/${media.key}`,
+            url: media.url ?? `/api/media/${media.key}`,
           }
         : null,
       createdAt: row.created_at ?? null,
@@ -1432,10 +1556,54 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
     return Boolean(selectAwayReply.get(chatJid, windowKey));
   }
 
+  /**
+   * Deletes every row from every table, in one transaction. Children go first
+   * (join/recipient/log tables) so the foreign keys stay satisfied.
+   *
+   * Powers the "clear backend data" action. The WhatsApp session lives in the
+   * auth store (./auth or Postgres), not here, so the device stays linked.
+   *
+   * @returns {number} the number of tables emptied
+   */
+  function clearAll() {
+    const tables = [
+      "broadcast_recipients",
+      "broadcasts",
+      "list_contacts",
+      "lists",
+      "contacts",
+      "templates",
+      "messages",
+      "chat_aliases",
+      "chats",
+      "moderation_log",
+      "guard_strikes",
+      "guard_settings",
+      "auto_reply_groups",
+      "auto_reply_rules",
+      "away_replies",
+      "away_settings",
+    ];
+    db.exec("begin");
+    try {
+      for (const table of tables) db.prepare(`delete from ${table}`).run();
+      db.exec("commit");
+    } catch (err) {
+      db.exec("rollback");
+      throw err;
+    }
+    return tables.length;
+  }
+
   return {
     save,
     listConversations,
     getMessages,
+    getMessage,
+    getMessageRaw,
+    markMessageDeleted,
+    updateMessageText,
+    setMessageReaction,
     markRead,
     setFlagged,
     resolveChatJid,
@@ -1485,6 +1653,7 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
     saveAwaySettings,
     markAwayReply,
     hasAwayReply,
+    clearAll,
     close() {
       db.close();
     },

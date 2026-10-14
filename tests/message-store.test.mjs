@@ -54,6 +54,10 @@ test("store creates schema on first save", async () => {
   assert.ok(ddl.includes("add column if not exists sender_email"), "migration for existing tables");
   assert.ok(ddl.includes("media jsonb"), "media column");
   assert.ok(ddl.includes("add column if not exists media jsonb"), "media column migration");
+  assert.ok(ddl.includes("quoted jsonb"), "quoted column");
+  assert.ok(ddl.includes("add column if not exists quoted jsonb"), "quoted column migration");
+  assert.ok(ddl.includes("reactions jsonb"), "reactions column");
+  assert.ok(ddl.includes("add column if not exists reactions jsonb"), "reactions column migration");
   assert.ok(ddl.includes("references \"public\".\"chats\"(jid)"), "FK to chats");
   assert.ok(ddl.includes("create index if not exists idx_messages_chat_time"), "chat time index");
   assert.ok(ddl.includes("create index if not exists idx_messages_from_me"), "from_me index");
@@ -107,7 +111,7 @@ test("raw payload jsonb survives Buffers (BufferJSON)", async () => {
   });
 
   const insert = pool.calls.find((c) => c.text.startsWith("insert into \"public\".\"messages\""));
-  const parsed = JSON.parse(insert.params[8]);
+  const parsed = JSON.parse(insert.params[9]);
   assert.equal(parsed.message.imageMessage.jpegThumbnail.type, "Buffer");
   assert.equal(parsed.message.imageMessage.jpegThumbnail.data, "YWJj");
   assert.equal(parsed.message.imageMessage.url, "x");
@@ -131,15 +135,17 @@ test("message insert maps columns correctly", async () => {
 
   const insert = pool.calls.find((c) => c.text.startsWith("insert into \"public\".\"messages\""));
   assert.ok(insert.text.includes("media"), "media column written");
+  assert.ok(insert.text.includes("quoted"), "quoted column written");
   assert.deepEqual(
     // id, chat_jid, from_me, sender_jid, content
     insert.params.slice(0, 5),
     ["C", "grp@g.us", false, "999@s.whatsapp.net", "yo"]
   );
   assert.equal(insert.params[5], null, "media stays null for text messages");
-  assert.equal(insert.params[6], new Date(receivedAt).toISOString(), "timestamp");
-  assert.equal(insert.params[7], "sender@gmail.com", "sender_email column");
-  assert.equal(insert.params[8], "{\"key\":{\"id\":\"C\"}}", "raw payload param");
+  assert.equal(insert.params[6], null, "quoted stays null without a reply");
+  assert.equal(insert.params[7], new Date(receivedAt).toISOString(), "timestamp");
+  assert.equal(insert.params[8], "sender@gmail.com", "sender_email column");
+  assert.equal(insert.params[9], "{\"key\":{\"id\":\"C\"}}", "raw payload param");
   assert.ok(insert.text.includes("on conflict (id) do nothing"), "id dedupe");
 });
 
@@ -234,6 +240,33 @@ test("store is idempotent across saves (no repeated migration)", async () => {
   assert.ok(ddlCalls[0].text.includes("create table if not exists \"public\".\"templates\""));
 });
 
+test("pg getMessageRaw returns the stored key and content for replies", async () => {
+  const pool = makeRowPool({
+    messages: [
+      {
+        id: "src",
+        chat_jid: "123@s.whatsapp.net",
+        from_me: false,
+        raw_payload: {
+          key: { id: "src", remoteJid: "123@s.whatsapp.net" },
+          message: { conversation: "hello" },
+        },
+        deleted: false,
+      },
+    ],
+  });
+  const store = createPostgresMessageStore({ pool, autoMigrate: false });
+  const raw = await store.getMessageRaw("123@s.whatsapp.net", "src");
+  assert.equal(raw.id, "src");
+  assert.equal(raw.fromMe, false);
+  assert.equal(raw.key.id, "src");
+  assert.equal(raw.message.conversation, "hello");
+  assert.equal(raw.deleted, false);
+
+  const call = pool.calls.find((c) => c.text.includes("raw_payload"));
+  assert.deepEqual(call.params, ["123@s.whatsapp.net", "src"]);
+});
+
 function makeRowPool({ messages = [], chats = [] } = {}) {
   const calls = [];
   return {
@@ -247,6 +280,69 @@ function makeRowPool({ messages = [], chats = [] } = {}) {
     calls,
   };
 }
+
+test("pg save folds a system payload into raw_payload", async () => {
+  const pool = makePool();
+  const store = createPostgresMessageStore({ pool });
+  await store.save({
+    id: "sys-1",
+    chat: "grp@g.us",
+    isGroup: true,
+    fromMe: false,
+    sender: "999@s.whatsapp.net",
+    text: "Alice added Bob",
+    receivedAt: Date.now(),
+    raw: null,
+    system: {
+      action: "add",
+      actor: "999@s.whatsapp.net",
+      participants: ["555@s.whatsapp.net"],
+    },
+  });
+  const insert = pool.calls.find((c) => c.text.startsWith("insert into \"public\".\"messages\""));
+  assert.deepEqual(JSON.parse(insert.params[9]), {
+    system: {
+      action: "add",
+      actor: "999@s.whatsapp.net",
+      participants: ["555@s.whatsapp.net"],
+    },
+  });
+});
+
+test("pg setMessageReaction merges, replaces and clears per reactor", async () => {
+  const pool = makeRowPool({
+    messages: [{ reactions: { me: { text: "👍", at: 1 } } }],
+  });
+  const store = createPostgresMessageStore({ pool, autoMigrate: false });
+
+  const added = await store.setMessageReaction("123@s.whatsapp.net", "m1", "234@s.whatsapp.net", {
+    text: "❤️",
+    at: 2,
+    name: "Ada",
+  });
+  assert.deepEqual(added, {
+    me: { text: "👍", at: 1 },
+    "234@s.whatsapp.net": { text: "❤️", at: 2, name: "Ada" },
+  });
+  const updates = pool.calls.filter((c) => c.text.includes("set reactions"));
+  assert.deepEqual(JSON.parse(updates[0].params[0]), {
+    me: { text: "👍", at: 1 },
+    "234@s.whatsapp.net": { text: "❤️", at: 2, name: "Ada" },
+  });
+
+  // Clearing the only entry stores null rather than an empty object.
+  const cleared = await store.setMessageReaction("123@s.whatsapp.net", "m1", "me", null);
+  assert.deepEqual(cleared, {});
+  const updates2 = pool.calls.filter((c) => c.text.includes("set reactions"));
+  assert.equal(updates2[1].params[0], null, "empty map stored as null");
+
+  // An unknown message is a no-op.
+  const empty = createPostgresMessageStore({ pool: makePool(), autoMigrate: false });
+  assert.equal(
+    await empty.setMessageReaction("123@s.whatsapp.net", "nope", "me", { text: "x" }),
+    null
+  );
+});
 
 test("listConversations maps pg rows into conversations", async () => {
   const pool = makeRowPool({
@@ -1330,4 +1426,44 @@ test("pg identities: existing split chats are merged during migration", async ()
     PG_LID,
     "the old PN id still resolves to the LID"
   );
+});
+
+/* ------------------------------------------------------------------ */
+/*  Clear all data                                                     */
+/* ------------------------------------------------------------------ */
+
+test("pg clearAll deletes every table in one transaction", async () => {
+  const pool = makePool();
+  const store = createPostgresMessageStore({ pool, autoMigrate: false });
+
+  const tables = [
+    "broadcast_recipients",
+    "broadcasts",
+    "list_contacts",
+    "lists",
+    "contacts",
+    "templates",
+    "messages",
+    "chat_aliases",
+    "chats",
+    "moderation_log",
+    "guard_strikes",
+    "guard_settings",
+    "auto_reply_groups",
+    "auto_reply_rules",
+    "away_replies",
+    "away_settings",
+  ];
+
+  assert.equal(await store.clearAll(), tables.length);
+
+  const deletes = pool.calls
+    .filter((c) => c.text.startsWith("delete from "))
+    .map((c) => c.text);
+  for (const table of tables) {
+    assert.ok(deletes.includes(`delete from "public"."${table}"`), `${table} is cleared`);
+  }
+  assert.equal(deletes.length, tables.length, "one delete per table, no extras");
+  assert.deepEqual(pool.transactions, ["begin", "commit"], "clearAll runs in one transaction");
+  assert.equal(pool.client.released, true, "client must be released");
 });

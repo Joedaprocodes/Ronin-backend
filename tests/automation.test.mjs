@@ -276,16 +276,16 @@ test("auto-replies quote the trigger by default and can send standalone", async 
   const connection = fakeConnection();
   const engine = createAutomationEngine({ connection, store, templateStore: store, mediaStore: null });
 
-  const quoted = { key: { id: "orig", remoteJid: DM, fromMe: false }, message: { conversation: "hi" } };
+  const target = { key: { id: "orig", remoteJid: DM, fromMe: false }, message: { conversation: "hi" } };
 
   // Default: the reply quotes the triggering message.
-  await engine.handle({ ...dm("hi"), quoted });
+  await engine.handle({ ...dm("hi"), quotedTarget: target });
   assert.equal(connection.sent.length, 1);
-  assert.deepEqual(connection.sent[0].options, { quoted });
+  assert.deepEqual(connection.sent[0].options, { quoted: target });
 
   // quote off -> a standalone send (no quoted option).
   store.updateAutoReply(rule.id, { quote: false });
-  await engine.handle({ ...dm("hi"), quoted });
+  await engine.handle({ ...dm("hi"), quotedTarget: target });
   assert.equal(connection.sent[1].options, undefined);
 
   // quote on but the trigger carries nothing to quote -> standalone send.
@@ -305,10 +305,10 @@ test("away replies quote the trigger when enabled", async () => {
   const connection = fakeConnection();
   const engine = createAutomationEngine({ connection, store, templateStore: store, mediaStore: null });
 
-  const quoted = { key: { id: "orig", remoteJid: DM, fromMe: false }, message: { conversation: "you there?" } };
-  await engine.handle({ ...dm("you there?"), quoted });
+  const target = { key: { id: "orig", remoteJid: DM, fromMe: false }, message: { conversation: "you there?" } };
+  await engine.handle({ ...dm("you there?"), quotedTarget: target });
   assert.equal(connection.sent.length, 1);
-  assert.deepEqual(connection.sent[0].options, { quoted });
+  assert.deepEqual(connection.sent[0].options, { quoted: target });
 
   store.close();
 });

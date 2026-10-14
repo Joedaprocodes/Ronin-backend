@@ -151,6 +151,56 @@ test("unread honors read_at", () => {
   assert.equal(readLater.unread, 1, "only messages after read_at count");
 });
 
+test("system lines and reactions map onto views, and system rows aren't unread", () => {
+  const now = Date.now();
+  const conv = groupConversations({
+    messages: [
+      {
+        id: "m1",
+        chat: "grp@g.us",
+        fromMe: false,
+        sender: "1@s.whatsapp.net",
+        text: "hi",
+        tsMs: now - 5_000,
+        pushName: "Tunde",
+        reactions: {
+          me: { text: "👍", at: 1 },
+          "234@s.whatsapp.net": { text: "❤️", at: 2, name: "Ada" },
+          "345@s.whatsapp.net": { text: "" }, // cleared — never surfaces
+        },
+      },
+      {
+        id: "sys-1",
+        chat: "grp@g.us",
+        fromMe: false,
+        sender: "999@s.whatsapp.net",
+        text: "Alice added Bob",
+        tsMs: now - 1_000,
+        pushName: null,
+        system: {
+          action: "add",
+          actor: "999@s.whatsapp.net",
+          participants: ["555@s.whatsapp.net"],
+        },
+      },
+    ],
+    chats: new Map([["grp@g.us", meta("grp@g.us", { isGroup: true })]]),
+  })[0];
+
+  assert.equal(conv.unread, 1, "system rows never inflate the unread badge");
+  const [first, second] = conv.messages;
+  assert.deepEqual(first.reactions, [
+    { text: "👍", from: "me" },
+    { text: "❤️", from: "them", sender: "Ada" },
+  ]);
+  assert.deepEqual(second.system, {
+    action: "add",
+    actor: "999@s.whatsapp.net",
+    participants: ["555@s.whatsapp.net"],
+  });
+  assert.equal(second.text, "Alice added Bob", "system text is the display line");
+});
+
 test("conversationThread builds a single ascending thread or null", () => {
   const now = Date.now();
   const thread = conversationThread({

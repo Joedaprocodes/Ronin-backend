@@ -19,8 +19,10 @@ import { renderTemplate } from "./render.js";
  */
 export async function loadTemplateMedia(template, mediaStore) {
   if (!template?.media) return { media: null };
-  const url = template.media.url;
-  const key = typeof url === "string" ? url.split("/").pop() : null;
+  // The view stores the key in `url` (either /api/media/<key> for the disk
+  // store or the Supabase public URL); take the last path segment either way.
+  const raw = template.media.key ?? template.media.url;
+  const key = typeof raw === "string" ? raw.split(/[?#]/)[0].split("/").pop() : null;
   const found = key && mediaStore ? await mediaStore.read(key) : null;
   if (!found) return { error: "template media could not be read" };
   return {

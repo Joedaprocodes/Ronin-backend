@@ -23,8 +23,8 @@
  * By default a reply is a WhatsApp **quoted reply** to the message that
  * triggered it (`quote`); turning `quote` off sends the template as a
  * standalone message. The trigger is quoted only when the connection supplied
- * the original message (`message.quoted`); otherwise we fall back to a plain
- * send.
+ * the original message (`message.quotedTarget`); otherwise we fall back to a
+ * plain send.
  */
 
 import { evaluateAwayWindow } from "../db/automation.js";
@@ -169,7 +169,8 @@ export function createAutomationEngine({ connection, store, templateStore, media
       phone: phoneDigits(message.chat),
     });
 
-    const options = quote && message.quoted ? { quoted: message.quoted } : undefined;
+    const options =
+      quote && message.quotedTarget ? { quoted: message.quotedTarget } : undefined;
     try {
       await connection.sendMessage(message.chat, content, null, options);
       return true;

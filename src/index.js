@@ -7,7 +7,8 @@ import { loadConfig } from "./config.js";
 import { createApiServer } from "./api/server.js";
 
 // Session + message storage (Supabase Postgres if DATABASE_URL is set) + media
-// bytes (mediaStore, MEDIA_DIR default ./data/media; served via /api/media/:id)
+// bytes (mediaStore: on disk locally, a Supabase bucket in production; served
+// as a Supabase public URL or, for disk refs, via /api/media/:id)
 const { pool, auth, messageStore, mediaStore } = loadConfig();
 
 // Link with a phone number: set PHONE_NUMBER (country code, digits only, e.g. 15551234567).
@@ -64,10 +65,11 @@ wa.on("disconnected", ({ code }) => console.log(`[wa] disconnected (code: ${code
 wa.on("logged_out", () => console.log("[wa] logged out from the phone. Linking starts again."));
 wa.on("failure", (err) => console.error(`[wa] failure: ${err.message}`));
 
-// Inbox API (separate from the WhatsApp wiring). Leave API_PORT set in .env to
-// pick the port; defaults to 3001. A null messageStore still boots the server,
-// but /api/inbox returns 503 until one is configured.
-const apiPort = Number(process.env.API_PORT ?? 3001);
+// Inbox API (separate from the WhatsApp wiring). Prefers PORT when the host
+// provides one (Render, Railway, Fly, Heroku all inject it), then API_PORT from
+// .env, then 3001. A null messageStore still boots the server, but /api/inbox
+// returns 503 until one is configured.
+const apiPort = Number(process.env.PORT ?? process.env.API_PORT ?? 3001);
 const api = createApiServer({
   messageStore,
   templateStore: messageStore, // templates live in the same dual store
