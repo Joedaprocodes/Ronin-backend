@@ -2890,3 +2890,178 @@ test("GET /api/groups/:jid falls back to a stale snapshot when a live read fails
     await closeApi(api);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Games (PATCH /api/games/:id)
+// ---------------------------------------------------------------------------
+
+/** A stored scheduled game (bypasses POST so tests can seed any status). */
+function seedGame(store, over = {}) {
+  return store.createGame({
+    title: "Trivia",
+    groupJid: "120363000000@g.us",
+    password: "pw",
+    startAt: new Date(Date.now() + 60_000).toISOString(),
+    questions: [
+      { question: "2+2?", options: ["3", "4"], correct: [1], timeLimit: 10, multi: false },
+    ],
+    ...over,
+  });
+}
+
+test("PATCH /api/games/:id fully edits a scheduled game", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const api = createApiServer({ messageStore: store });
+  const base = await listen(api);
+  try {
+    const game = await seedGame(store);
+    const res = await postJson(
+      base,
+      `/api/games/${game.id}`,
+      {
+        title: "Renamed",
+        questionTimeSeconds: 45,
+        betweenQuestionsSeconds: 3,
+        advanceMode: "manual",
+        groupToDmDelaySeconds: 2,
+        dmQuestionVisibility: "hidden",
+        minDelaySeconds: 5,
+        maxDelaySeconds: 10,
+      },
+      "PATCH"
+    );
+    assert.equal(res.status, 200);
+    const { game: updated } = await res.json();
+    assert.equal(updated.title, "Renamed");
+    assert.equal(updated.questionTimeSeconds, 45);
+    assert.equal(updated.betweenQuestionsSeconds, 3);
+    assert.equal(updated.advanceMode, "manual");
+    assert.equal(updated.groupToDmDelaySeconds, 2);
+    assert.equal(updated.dmQuestionVisibility, "hidden");
+    assert.equal(updated.minDelaySeconds, 5);
+    assert.equal(updated.maxDelaySeconds, 10);
+    assert.equal(updated.questionCount, 1, "questions are kept when omitted");
+    assert.equal(updated.hasPassword, true, "the password is kept (and stays masked)");
+
+    // Validation mirrors the scheduling rules.
+    const badMode = await postJson(
+      base, `/api/games/${game.id}`, { advanceMode: "fast" }, "PATCH"
+    );
+    assert.equal(badMode.status, 400);
+    assert.match((await badMode.json()).error, /advanceMode/);
+    const badTime = await postJson(
+      base, `/api/games/${game.id}`, { questionTimeSeconds: 0 }, "PATCH"
+    );
+    assert.equal(badTime.status, 400);
+    const rotated = await postJson(
+      base, `/api/games/${game.id}`, { password: "new" }, "PATCH"
+    );
+    assert.equal(rotated.status, 400, "the password can't be rotated via PATCH");
+
+    const missing = await fetch(`${base}/api/games/missing`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(missing.status, 404);
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("PATCH /api/games/:id scopes live games to the question-flow fields", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const api = createApiServer({ messageStore: store });
+  const base = await listen(api);
+  try {
+    const game = await seedGame(store, { status: "running" });
+
+    const ok = await postJson(
+      base,
+      `/api/games/${game.id}`,
+      { betweenQuestionsSeconds: 9, advanceMode: "manual" },
+      "PATCH"
+    );
+    assert.equal(ok.status, 200);
+    const { game: updated } = await ok.json();
+    assert.equal(updated.betweenQuestionsSeconds, 9);
+    assert.equal(updated.advanceMode, "manual");
+    assert.equal(updated.title, "Trivia", "untouched fields survive the patch");
+
+    const title = await postJson(base, `/api/games/${game.id}`, { title: "Nope" }, "PATCH");
+    assert.equal(title.status, 400, "structural edits are rejected while running");
+    assert.match((await title.json()).error, /question-flow/);
+    const questions = await postJson(
+      base, `/api/games/${game.id}`, { questions: [] }, "PATCH"
+    );
+    assert.equal(questions.status, 400);
+    const negative = await postJson(
+      base, `/api/games/${game.id}`, { groupToDmDelaySeconds: -1 }, "PATCH"
+    );
+    assert.equal(negative.status, 400);
+    const empty = await postJson(base, `/api/games/${game.id}`, {}, "PATCH");
+    assert.equal(empty.status, 400, "an empty patch has nothing to write");
+
+    const done = await seedGame(store, { status: "finished" });
+    const finished = await postJson(
+      base, `/api/games/${done.id}`, { betweenQuestionsSeconds: 2 }, "PATCH"
+    );
+    assert.equal(finished.status, 409, "finished games are closed for edits");
+
+    const noEngine = await postJson(
+      base, `/api/games/${game.id}`, { action: "next" }, "PATCH"
+    );
+    assert.equal(noEngine.status, 503, "action=next needs a game engine");
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});
+
+test("PATCH /api/games/:id is token-gated and drives manual advance through the engine", async () => {
+  const store = createSqliteMessageStore({ file: ":memory:" });
+  const game = await seedGame(store, { status: "running" });
+  let nextResult = { ok: false, reason: "not-held" };
+  const gameEngine = {
+    advanceManual: async (id) =>
+      id === game.id ? nextResult : { ok: false, reason: "status" },
+  };
+  const api = createApiServer({
+    messageStore: store,
+    gameEngine,
+    apiToken: "sekrit",
+  });
+  const base = await listen(api);
+  try {
+    const patch = (payload, headers = {}) =>
+      fetch(`${base}/api/games/${game.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify(payload),
+      });
+
+    assert.equal((await patch({ betweenQuestionsSeconds: 4 })).status, 401, "no token");
+    assert.equal(
+      (await patch({ betweenQuestionsSeconds: 4 }, { "x-api-token": "wrong" })).status,
+      401,
+      "wrong token"
+    );
+    const ok = await patch({ betweenQuestionsSeconds: 4 }, { "x-api-token": "sekrit" });
+    assert.equal(ok.status, 200, "right token");
+
+    const notHeld = await patch({ action: "next" }, { "x-api-token": "sekrit" });
+    assert.equal(notHeld.status, 409);
+    assert.match((await notHeld.json()).error, /waiting to advance/);
+
+    nextResult = { ok: true, gameId: game.id };
+    const advanced = await patch({ action: "next" }, { "x-api-token": "sekrit" });
+    assert.equal(advanced.status, 200);
+    const body = await advanced.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.game.id, game.id);
+  } finally {
+    await closeApi(api);
+    store.close();
+  }
+});

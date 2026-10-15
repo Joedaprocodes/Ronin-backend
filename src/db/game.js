@@ -30,6 +30,16 @@ export const MAX_DELAY_SECONDS = 3600;
 /** Below this, WhatsApp is more likely to flag the account — the UI warns. */
 export const RISKY_DELAY_SECONDS = 5;
 
+/** How a question advances once closed. `manual` waits for `.next`. */
+export const ADVANCE_MODES = ["auto", "manual"];
+/** What a DM answer poll shows as its question line. */
+export const DM_QUESTION_VISIBILITY = ["shown", "hidden"];
+
+/** Default pause (seconds) after a question's results before the next one. */
+export const DEFAULT_BETWEEN_QUESTIONS_SECONDS = 6;
+/** Default pause (seconds) between the group question text and DM polls. */
+export const DEFAULT_GROUP_TO_DM_DELAY_SECONDS = 5;
+
 export const MAX_TITLE_LENGTH = 120;
 export const MAX_PASSWORD_LENGTH = 64;
 export const MAX_QUESTIONS = 200;
@@ -48,6 +58,11 @@ export const DEFAULT_GAME = {
   minDelaySeconds: DEFAULT_MIN_DELAY,
   maxDelaySeconds: DEFAULT_MAX_DELAY,
   batchSize: DEFAULT_BATCH_SIZE,
+  questionTimeSeconds: null, // null = each question's own sheet time limit
+  betweenQuestionsSeconds: DEFAULT_BETWEEN_QUESTIONS_SECONDS,
+  advanceMode: "auto",
+  groupToDmDelaySeconds: DEFAULT_GROUP_TO_DM_DELAY_SECONDS,
+  dmQuestionVisibility: "shown",
   questions: [],
   questionIndex: 0,
 };
@@ -80,6 +95,77 @@ export function normalizeQuestions(questions = []) {
     return q;
   });
   return parseQuestions(asRows);
+}
+
+/**
+ * Parses the five editable timing/flow fields shared by scheduling and live
+ * game updates: `questionTimeSeconds` (nullable per-sheet override),
+ * `betweenQuestionsSeconds`, `advanceMode`, `groupToDmDelaySeconds` and
+ * `dmQuestionVisibility`. Absent/null keeps the default (so callers merge the
+ * result onto DEFAULT_GAME for scheduling, or onto a live row for a PATCH).
+ *
+ * @returns {{ fields?: object, error?: string }}
+ */
+function parseTimingFields(input = {}) {
+  const fields = {};
+
+  if (input.questionTimeSeconds !== undefined && input.questionTimeSeconds !== null) {
+    const qt = Number(input.questionTimeSeconds);
+    if (!Number.isFinite(qt) || qt < 1 || qt > MAX_DELAY_SECONDS) {
+      return { error: `questionTimeSeconds must be between 1 and ${MAX_DELAY_SECONDS}` };
+    }
+    fields.questionTimeSeconds = Math.round(qt);
+  }
+
+  if (input.betweenQuestionsSeconds !== undefined && input.betweenQuestionsSeconds !== null) {
+    const bq = Number(input.betweenQuestionsSeconds);
+    if (!Number.isFinite(bq) || bq < 0 || bq > MAX_DELAY_SECONDS) {
+      return { error: `betweenQuestionsSeconds must be between 0 and ${MAX_DELAY_SECONDS}` };
+    }
+    fields.betweenQuestionsSeconds = Math.round(bq);
+  }
+
+  if (input.advanceMode !== undefined && input.advanceMode !== null) {
+    if (!ADVANCE_MODES.includes(input.advanceMode)) {
+      return { error: "advanceMode must be one of: auto, manual" };
+    }
+    fields.advanceMode = input.advanceMode;
+  }
+
+  if (input.groupToDmDelaySeconds !== undefined && input.groupToDmDelaySeconds !== null) {
+    const gd = Number(input.groupToDmDelaySeconds);
+    if (!Number.isFinite(gd) || gd < 0 || gd > MAX_DELAY_SECONDS) {
+      return { error: `groupToDmDelaySeconds must be between 0 and ${MAX_DELAY_SECONDS}` };
+    }
+    fields.groupToDmDelaySeconds = Math.round(gd);
+  }
+
+  if (input.dmQuestionVisibility !== undefined && input.dmQuestionVisibility !== null) {
+    if (!DM_QUESTION_VISIBILITY.includes(input.dmQuestionVisibility)) {
+      return { error: "dmQuestionVisibility must be one of: shown, hidden" };
+    }
+    fields.dmQuestionVisibility = input.dmQuestionVisibility;
+  }
+
+  return { fields };
+}
+
+/**
+ * Validates just the timing/flow fields of a game update (used by
+ * `PATCH /api/games/:id` while a game is lobby/running). An explicit
+ * `questionTimeSeconds: null` clears the override; the other fields fall back
+ * to their defaults when omitted.
+ *
+ * @returns {{ patch?: object, error?: string }}
+ */
+export function validateTimingInput(input = {}) {
+  const { fields, error } = parseTimingFields(input);
+  if (error) return { error };
+  const patch = { ...fields };
+  if ("questionTimeSeconds" in input && input.questionTimeSeconds == null) {
+    patch.questionTimeSeconds = null; // explicitly clear the per-sheet override
+  }
+  return { patch };
 }
 
 /**
@@ -132,6 +218,16 @@ export function validateScheduleInput(input = {}) {
   game.minDelaySeconds = Math.round(min);
   game.maxDelaySeconds = Math.round(max);
 
+  const batch = Number(input.batchSize ?? DEFAULT_BATCH_SIZE);
+  if (!Number.isFinite(batch) || batch < 1 || batch > 50) {
+    return { error: "batchSize must be between 1 and 50" };
+  }
+  game.batchSize = Math.round(batch);
+
+  const timing = parseTimingFields(input);
+  if (timing.error) return { error: timing.error };
+  Object.assign(game, timing.fields);
+
   const { questions, errors } = normalizeQuestions(input.questions);
   if (errors.length) {
     return { error: "some questions are invalid", rowErrors: errors };
@@ -168,6 +264,24 @@ export function gameToView(row, { playerCount = null, withQuestions = false } = 
     minDelaySeconds: row.min_delay_seconds ?? row.minDelaySeconds ?? DEFAULT_MIN_DELAY,
     maxDelaySeconds: row.max_delay_seconds ?? row.maxDelaySeconds ?? DEFAULT_MAX_DELAY,
     batchSize: row.batch_size ?? row.batchSize ?? DEFAULT_BATCH_SIZE,
+    questionTimeSeconds:
+      row.question_time_seconds ?? row.questionTimeSeconds ?? null,
+    betweenQuestionsSeconds:
+      row.between_questions_seconds ??
+      row.betweenQuestionsSeconds ??
+      DEFAULT_BETWEEN_QUESTIONS_SECONDS,
+    advanceMode: ADVANCE_MODES.includes(row.advance_mode ?? row.advanceMode)
+      ? (row.advance_mode ?? row.advanceMode)
+      : "auto",
+    groupToDmDelaySeconds:
+      row.group_to_dm_delay_seconds ??
+      row.groupToDmDelaySeconds ??
+      DEFAULT_GROUP_TO_DM_DELAY_SECONDS,
+    dmQuestionVisibility: DM_QUESTION_VISIBILITY.includes(
+      row.dm_question_visibility ?? row.dmQuestionVisibility
+    )
+      ? (row.dm_question_visibility ?? row.dmQuestionVisibility)
+      : "shown",
     questionCount: questions.length,
     questionIndex: row.question_index ?? row.questionIndex ?? 0,
     hostJid: row.host_jid ?? row.hostJid ?? null,
@@ -229,6 +343,11 @@ export const GAME_COLUMNS = {
   minDelaySeconds: "min_delay_seconds",
   maxDelaySeconds: "max_delay_seconds",
   batchSize: "batch_size",
+  questionTimeSeconds: "question_time_seconds",
+  betweenQuestionsSeconds: "between_questions_seconds",
+  advanceMode: "advance_mode",
+  groupToDmDelaySeconds: "group_to_dm_delay_seconds",
+  dmQuestionVisibility: "dm_question_visibility",
   questions: "questions",
   questionIndex: "question_index",
   joinMessageId: "join_message_id",

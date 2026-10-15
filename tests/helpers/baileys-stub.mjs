@@ -161,7 +161,8 @@ export default function makeWASocket() {
     },
     sendMessage: async (jid, content) => {
       const key = { id: `sent-${++sentCounter}`, remoteJid: jid, fromMe: true };
-      sock.sent.push({ jid, content, key });
+      // `at` lets tests assert the real ordering/pauses between sends.
+      sock.sent.push({ jid, content, key, at: Date.now() });
       return { key, message: content };
     },
     groupMetadata: async (jid) => groupMetas.get(jid) ?? null,

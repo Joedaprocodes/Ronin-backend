@@ -237,6 +237,11 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
       min_delay_seconds   integer not null default 8,
       max_delay_seconds   integer not null default 25,
       batch_size          integer not null default 10,
+      question_time_seconds integer,
+      between_questions_seconds integer not null default 6,
+      advance_mode        text not null default 'auto',
+      group_to_dm_delay_seconds integer not null default 5,
+      dm_question_visibility text not null default 'shown',
       questions           text not null default '[]',
       question_index      integer not null default 0,
       join_message_id     text,
@@ -323,6 +328,22 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
   const awayColumns = db.prepare("pragma table_info(away_settings)").all().map((c) => c.name);
   if (!awayColumns.includes("quote")) {
     db.exec("alter table away_settings add column quote integer not null default 1");
+  }
+  const gameColumns = db.prepare("pragma table_info(games)").all().map((c) => c.name);
+  if (!gameColumns.includes("question_time_seconds")) {
+    db.exec("alter table games add column question_time_seconds integer");
+  }
+  if (!gameColumns.includes("between_questions_seconds")) {
+    db.exec("alter table games add column between_questions_seconds integer not null default 6");
+  }
+  if (!gameColumns.includes("advance_mode")) {
+    db.exec("alter table games add column advance_mode text not null default 'auto'");
+  }
+  if (!gameColumns.includes("group_to_dm_delay_seconds")) {
+    db.exec("alter table games add column group_to_dm_delay_seconds integer not null default 5");
+  }
+  if (!gameColumns.includes("dm_question_visibility")) {
+    db.exec("alter table games add column dm_question_visibility text not null default 'shown'");
   }
 
   const insertChat = db.prepare(`
@@ -1744,9 +1765,11 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
     db.prepare(
       `insert into games
          (id, title, group_jid, password, status, start_at,
-          min_delay_seconds, max_delay_seconds, batch_size, questions,
-          question_index, host_jid, created_at, updated_at)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          min_delay_seconds, max_delay_seconds, batch_size,
+          question_time_seconds, between_questions_seconds, advance_mode,
+          group_to_dm_delay_seconds, dm_question_visibility,
+          questions, question_index, host_jid, created_at, updated_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
       game.title,
@@ -1757,6 +1780,11 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
       game.minDelaySeconds ?? 8,
       game.maxDelaySeconds ?? 25,
       game.batchSize ?? 10,
+      game.questionTimeSeconds ?? null,
+      game.betweenQuestionsSeconds ?? 6,
+      game.advanceMode ?? "auto",
+      game.groupToDmDelaySeconds ?? 5,
+      game.dmQuestionVisibility ?? "shown",
       JSON.stringify(game.questions ?? []),
       game.questionIndex ?? 0,
       game.hostJid ?? null,

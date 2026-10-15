@@ -189,6 +189,11 @@ export async function ensureMessageSchema(
     alter table ${messagesName} add column if not exists edited boolean not null default false;
     alter table ${messagesName} add column if not exists edits jsonb;
     alter table ${messagesName} add column if not exists reactions jsonb;
+    alter table ${gamesName} add column if not exists question_time_seconds integer;
+    alter table ${gamesName} add column if not exists between_questions_seconds integer not null default 6;
+    alter table ${gamesName} add column if not exists advance_mode text not null default 'auto';
+    alter table ${gamesName} add column if not exists group_to_dm_delay_seconds integer not null default 5;
+    alter table ${gamesName} add column if not exists dm_question_visibility text not null default 'shown';
     create index if not exists idx_messages_chat_time on ${messagesName}(chat_jid, timestamp desc);
     create index if not exists idx_messages_from_me on ${messagesName}(from_me);
     create table if not exists ${guardSettingsName} (
@@ -266,6 +271,11 @@ export async function ensureMessageSchema(
       min_delay_seconds   integer     not null default 8,
       max_delay_seconds   integer     not null default 25,
       batch_size          integer     not null default 10,
+      question_time_seconds integer,
+      between_questions_seconds integer not null default 6,
+      advance_mode        text        not null default 'auto',
+      group_to_dm_delay_seconds integer not null default 5,
+      dm_question_visibility text   not null default 'shown',
       questions           jsonb       not null default '[]'::jsonb,
       question_index      integer     not null default 0,
       join_message_id     text,
@@ -1821,9 +1831,11 @@ export function createPostgresMessageStore({
     const { rows } = await pool.query(
       `insert into ${gamesName}
          (id, title, group_jid, password, status, start_at,
-          min_delay_seconds, max_delay_seconds, batch_size, questions,
-          question_index, host_jid, created_at, updated_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$13)
+          min_delay_seconds, max_delay_seconds, batch_size,
+          question_time_seconds, between_questions_seconds, advance_mode,
+          group_to_dm_delay_seconds, dm_question_visibility,
+          questions, question_index, host_jid, created_at, updated_at)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16,$17,$18,$18)
        returning *`,
       [
         id,
@@ -1835,6 +1847,11 @@ export function createPostgresMessageStore({
         game.minDelaySeconds ?? 8,
         game.maxDelaySeconds ?? 25,
         game.batchSize ?? 10,
+        game.questionTimeSeconds ?? null,
+        game.betweenQuestionsSeconds ?? 6,
+        game.advanceMode ?? "auto",
+        game.groupToDmDelaySeconds ?? 5,
+        game.dmQuestionVisibility ?? "shown",
         JSON.stringify(game.questions ?? []),
         game.questionIndex ?? 0,
         game.hostJid ?? null,

@@ -15,7 +15,7 @@ import {
   validateAutoReply,
   validateAwaySettings,
 } from "../db/automation.js";
-import { validateScheduleInput } from "../db/game.js";
+import { validateScheduleInput, validateTimingInput } from "../db/game.js";
 import { groupInfoFromSnapshot, toGroupSnapshot } from "../whatsapp/group-snapshot.js";
 import { GROUP_SNAPSHOT_TTL_MS, PAIRING_CODE_TTL_MS } from "../whatsapp/utils.js";
 
@@ -1675,7 +1675,7 @@ export function createApiServer({
       // polls. Reads are open; writes are gated by the API token.
       if (path === "/api/games" || path.startsWith("/api/games/")) {
         if (
-          ["POST", "DELETE"].includes(req.method) &&
+          ["POST", "PATCH", "DELETE"].includes(req.method) &&
           apiToken &&
           !tokenMatches(req.headers["x-api-token"], apiToken)
         ) {
@@ -1749,6 +1749,109 @@ export function createApiServer({
               : await gmStore.deleteGame(id);
             if (!removed) return sendJson(res, 404, { error: "game not found" });
             return sendJson(res, 200, { ok: true, id });
+          }
+          if (req.method === "PATCH") {
+            const body = await readJson(req, res);
+            if (body === undefined) return;
+            const patch = body ?? {};
+            const row = await gmStore.getGameRow(id);
+            if (!row) return sendJson(res, 404, { error: "game not found" });
+            if (row.status === "finished" || row.status === "cancelled") {
+              return sendJson(res, 409, { error: "this game is already over" });
+            }
+
+            // Manual-advance trigger: the dashboard's "Next question" button.
+            if (patch.action === "next") {
+              if (!gameEngine) {
+                return sendJson(res, 503, { error: "no game engine configured" });
+              }
+              const advanced = await gameEngine.advanceManual(id);
+              if (!advanced.ok) {
+                return sendJson(res, advanced.reason === "not-held" ? 409 : 400, {
+                  error:
+                    advanced.reason === "not-held"
+                      ? "no question is waiting to advance"
+                      : "can't advance this game",
+                });
+              }
+              const game = await gmStore.getGame(id, { withQuestions: true });
+              return sendJson(res, 200, { ok: true, game });
+            }
+
+            const SCHEDULE_ONLY_KEYS = [
+              "title",
+              "groupJid",
+              "password",
+              "startAt",
+              "minDelaySeconds",
+              "maxDelaySeconds",
+              "batchSize",
+              "questions",
+            ];
+
+            if (row.status === "scheduled") {
+              // Full edit before the lobby opens. The password is masked in
+              // every view, so it is kept from the row (never rotated here).
+              if ("password" in patch) {
+                return sendJson(res, 400, {
+                  error: "the start password can't be changed after scheduling",
+                });
+              }
+              const present = (key) => Object.prototype.hasOwnProperty.call(patch, key);
+              const parsed = validateScheduleInput({
+                title: patch.title ?? row.title,
+                groupJid: patch.groupJid ?? row.group_jid,
+                password: row.password,
+                startAt: patch.startAt ?? row.start_at,
+                minDelaySeconds: patch.minDelaySeconds ?? row.min_delay_seconds,
+                maxDelaySeconds: patch.maxDelaySeconds ?? row.max_delay_seconds,
+                batchSize: patch.batchSize ?? row.batch_size,
+                questionTimeSeconds: present("questionTimeSeconds")
+                  ? patch.questionTimeSeconds
+                  : row.question_time_seconds,
+                betweenQuestionsSeconds: present("betweenQuestionsSeconds")
+                  ? patch.betweenQuestionsSeconds
+                  : row.between_questions_seconds,
+                advanceMode: present("advanceMode") ? patch.advanceMode : row.advance_mode,
+                groupToDmDelaySeconds: present("groupToDmDelaySeconds")
+                  ? patch.groupToDmDelaySeconds
+                  : row.group_to_dm_delay_seconds,
+                dmQuestionVisibility: present("dmQuestionVisibility")
+                  ? patch.dmQuestionVisibility
+                  : row.dm_question_visibility,
+                questions: patch.questions ?? row.questions,
+              });
+              if (parsed.error) {
+                return sendJson(res, 400, {
+                  error: parsed.error,
+                  ...(parsed.rowErrors ? { rowErrors: parsed.rowErrors } : {}),
+                });
+              }
+              const game = await gmStore.updateGame(id, parsed.game);
+              if (!game) return sendJson(res, 404, { error: "game not found" });
+              return sendJson(res, 200, { ok: true, game });
+            }
+
+            // lobby / running: timing + flow only — every setting applies
+            // from the next question forward, never retroactively.
+            const disallowed = SCHEDULE_ONLY_KEYS.filter(
+              (key) => patch[key] !== undefined
+            );
+            if (disallowed.length) {
+              return sendJson(res, 400, {
+                error:
+                  `only the question-flow settings can be edited while the ` +
+                  `game is ${row.status} (rejected: ${disallowed.join(", ")})`,
+              });
+            }
+            const timing = validateTimingInput(patch);
+            if (timing.error) return sendJson(res, 400, { error: timing.error });
+            if (!Object.keys(timing.patch).length) {
+              return sendJson(res, 400, { error: "no editable fields in the request" });
+            }
+            const game = await gmStore.updateGame(id, timing.patch);
+            if (!game) return sendJson(res, 404, { error: "game not found" });
+            return sendJson(res, 200, { ok: true, game });
           }
         }
 

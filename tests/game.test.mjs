@@ -100,6 +100,9 @@ async function scheduleLobby(ctx, questions) {
     startAt: new Date(Date.now() + 15).toISOString(),
     minDelaySeconds: 0,
     maxDelaySeconds: 0,
+    // Keep the question flow instant in tests (production defaults: 5s / 6s).
+    groupToDmDelaySeconds: 0,
+    betweenQuestionsSeconds: 0,
     questions,
   });
   await waitFor(async () => (await store.getGame(game.id))?.status === "lobby");
@@ -155,7 +158,10 @@ const until = (target) => Math.max(0, target - Date.now());
  * with `.start <password>` from the group admin. `minDelaySeconds` doubles as
  * the gap between the two single-player DM batches (batchSize 1).
  */
-async function startTwoPlayerGame(ctx, { questions, minDelaySeconds = 0, batchSize = null } = {}) {
+async function startTwoPlayerGame(
+  ctx,
+  { questions, minDelaySeconds = 0, batchSize = null, ...extra } = {}
+) {
   const { engine, store } = ctx;
   const game = await engine.schedule({
     title: "Trivia",
@@ -165,6 +171,10 @@ async function startTwoPlayerGame(ctx, { questions, minDelaySeconds = 0, batchSi
     minDelaySeconds,
     maxDelaySeconds: minDelaySeconds,
     ...(batchSize ? { batchSize } : {}),
+    // Keep the question flow instant in tests unless a test overrides them.
+    groupToDmDelaySeconds: 0,
+    betweenQuestionsSeconds: 0,
+    ...extra,
     questions,
   });
   await waitFor(async () => (await store.getGame(game.id))?.status === "lobby");
@@ -279,7 +289,8 @@ test("start is gated on password + admin, then scores a full game", async () => 
   const send1 = (await store.listQuestionSends(game.id, 0))[0];
   assert.equal(send1.player_jid, PLAYER);
   const poll1 = sock.sent.find((s) => s.content?.poll && s.jid === PLAYER);
-  assert.equal(poll1.content.poll.name, "Capital of France?");
+  // DM polls are numbered: "shown" visibility prefixes the question text.
+  assert.equal(poll1.content.poll.name, "Q1: Capital of France?");
   assert.equal(poll1.content.poll.selectableCount, 1);
   assert.ok(send1.poll_secret);
   assert.ok(
@@ -578,4 +589,203 @@ test("a join vote arriving through messages.upsert registers the player", async 
   await waitFor(async () => (await store.getGamePlayer(raw.id, PLAYER)) !== null);
   const player = await store.getGamePlayer(raw.id, PLAYER);
   assert.equal(player.name, "Ada");
+});
+
+test("group-first flow: the question text lands in the group before the delayed DM polls", async () => {
+  __reset();
+  const ctx = await setup({ startDelayMs: 10, betweenQuestionsMs: 20, intraBatchJitterMs: 0 });
+  const { store, sock } = ctx;
+  const { game } = await startTwoPlayerGame(ctx, {
+    questions: [QUESTION],
+    groupToDmDelaySeconds: 1, // one second of shared reading time
+  });
+
+  await waitFor(async () => (await store.listQuestionSends(game.id, 0)).length === 2);
+
+  const groupIdx = sock.sent.findIndex(
+    (s) => s.jid === GROUP && (s.content?.text ?? "").includes("Q1/1")
+  );
+  assert.ok(groupIdx !== -1, "the full question text was posted to the group");
+  const groupEntry = sock.sent[groupIdx];
+  assert.ok(groupEntry.content.text.includes("Capital of France?"));
+  assert.ok(groupEntry.content.text.includes("A Paris"), "lettered options included");
+
+  const firstDmIdx = sock.sent.findIndex((s) => s.content?.poll && s.jid === PLAYER);
+  const secondDmIdx = sock.sent.findIndex((s) => s.content?.poll && s.jid === PLAYER2);
+  assert.ok(firstDmIdx > groupIdx, "no DM poll lands before the group text");
+  assert.ok(secondDmIdx > groupIdx, "no DM poll lands before the group text");
+  assert.ok(
+    sock.sent[firstDmIdx].at - groupEntry.at >= 900,
+    "the group-to-DM reading pause is honored"
+  );
+
+  // The "sent to N players" follow-up comes after the DMs, as before.
+  const sentLineIdx = sock.sent.findIndex(
+    (s) => s.jid === GROUP && /sent to 2 player/.test(s.content?.text ?? "")
+  );
+  assert.ok(sentLineIdx > firstDmIdx, "the sent-count line follows the DM polls");
+});
+
+test("dm question visibility: hidden polls carry only the number, shown polls the wording", async () => {
+  __reset();
+  const ctx = await setup({ startDelayMs: 10, betweenQuestionsMs: 20, intraBatchJitterMs: 0 });
+  const { store, sock } = ctx;
+  const { game } = await startTwoPlayerGame(ctx, {
+    questions: [QUESTION],
+    dmQuestionVisibility: "hidden",
+  });
+
+  await waitFor(async () => (await store.listQuestionSends(game.id, 0)).length === 2);
+  const polls = sock.sent.filter(
+    (s) => s.content?.poll && (s.jid === PLAYER || s.jid === PLAYER2)
+  );
+  assert.ok(polls.length >= 2, "both players got an answer poll");
+  for (const p of polls) assert.equal(p.content.poll.name, "Q1");
+});
+
+test("the game's question time override beats the sheet's time limit", async () => {
+  __reset();
+  const ctx = await setup({
+    startDelayMs: 10,
+    betweenQuestionsMs: 20,
+    intraBatchJitterMs: 0,
+    questionGraceMs: 0,
+  });
+  const { store } = ctx;
+  const { game } = await startTwoPlayerGame(ctx, {
+    // The sheet says a minute...
+    questions: [{ ...QUESTION, timeLimit: 60 }],
+    // ...but the game overrides every question to a one-second question.
+    questionTimeSeconds: 1,
+  });
+
+  await waitFor(async () => (await store.listQuestionSends(game.id, 0)).length === 2);
+  // Without the override this would only finalize ~60s after the sends.
+  await waitFor(
+    async () => {
+      const a = await store.getAnswer(game.id, 0, PLAYER);
+      const b = await store.getAnswer(game.id, 0, PLAYER2);
+      return a && b && a.seconds !== null && b.seconds !== null;
+    },
+    4000
+  );
+  assert.equal((await store.getGame(game.id)).questionTimeSeconds, 1);
+});
+
+test("manual advance holds after the leaderboard and .next gates host/admin", async () => {
+  __reset();
+  const ctx = await setup({ startDelayMs: 10, betweenQuestionsMs: 20, intraBatchJitterMs: 0 });
+  const { store, engine, sock } = ctx;
+  const questions = [
+    QUESTION,
+    { question: "2+2?", options: ["3", "4", "5"], correct: [1], timeLimit: 1, multi: false },
+  ];
+  const { game } = await startTwoPlayerGame(ctx, { questions, advanceMode: "manual" });
+
+  await waitFor(async () => (await store.listQuestionSends(game.id, 0)).length === 2);
+  // While the question is open nothing is held yet.
+  assert.deepEqual(await engine.advanceManual(game.id), { ok: false, reason: "not-held" });
+
+  const sends1 = await store.listQuestionSends(game.id, 0);
+  answer(ctx, sends1.find((s) => s.player_jid === PLAYER), "Paris");
+  answer(ctx, sends1.find((s) => s.player_jid === PLAYER2), "Paris");
+
+  // The close posts the leaderboard + hold prompt INSTEAD of advancing.
+  const prompt = "The host or a group admin sends `.next` to continue.";
+  await waitFor(async () =>
+    sock.sent.some((s) => s.jid === GROUP && (s.content?.text ?? "").includes(prompt))
+  );
+  assert.ok(
+    sock.sent.some((s) => s.jid === GROUP && /after Q1\/2/.test(s.content?.text ?? ""))
+  );
+  await sleep(300);
+  assert.equal(
+    (await store.listQuestionSends(game.id, 1)).length,
+    0,
+    "no next question while held"
+  );
+
+  // A plain player can't advance.
+  let res = await engine.nextFromCommand({ chat: GROUP, sender: PLAYER, isGroup: true });
+  assert.deepEqual(res, { ok: false, reason: "not-allowed" });
+  assert.ok(
+    sock.sent.some(
+      (s) => s.jid === GROUP && /Only the host or a group admin can advance/.test(s.content?.text ?? "")
+    )
+  );
+  await sleep(200);
+  assert.equal((await store.listQuestionSends(game.id, 1)).length, 0, "still held");
+
+  // The admin's `.next` (through the real message path) advances the game.
+  await engine.handleMessage({
+    chat: GROUP,
+    sender: ADMIN,
+    isGroup: true,
+    fromMe: false,
+    text: ".next",
+  });
+  await waitFor(async () => (await store.listQuestionSends(game.id, 1)).length === 2);
+  assert.ok(
+    sock.sent.some((s) => s.jid === GROUP && (s.content?.text ?? "").includes("Q2/2"))
+  );
+
+  // Closing the last question holds again; the host's `.next` finishes the game.
+  const sends2 = await store.listQuestionSends(game.id, 1);
+  answer(ctx, sends2.find((s) => s.player_jid === PLAYER), "4");
+  answer(ctx, sends2.find((s) => s.player_jid === PLAYER2), "4");
+  await waitFor(
+    async () =>
+      sock.sent.filter((s) => s.jid === GROUP && (s.content?.text ?? "").includes(prompt))
+        .length >= 2,
+    6000
+  );
+  res = await engine.nextFromCommand({ chat: GROUP, sender: ADMIN, isGroup: true });
+  assert.deepEqual(res, { ok: true, gameId: game.id });
+  await waitFor(async () => (await store.getGame(game.id))?.status === "finished");
+  assert.ok(
+    sock.sent.some((s) => s.jid === GROUP && /Final podium/.test(s.content?.text ?? ""))
+  );
+});
+
+test("auto mode waits the game's between-questions pause before the next question", async () => {
+  __reset();
+  const ctx = await setup({
+    startDelayMs: 10,
+    betweenQuestionsMs: 20,
+    intraBatchJitterMs: 0,
+    questionGraceMs: 0,
+  });
+  const { store, sock } = ctx;
+  const questions = [
+    QUESTION,
+    { question: "2+2?", options: ["3", "4", "5"], correct: [1], timeLimit: 1, multi: false },
+  ];
+  const { game } = await startTwoPlayerGame(ctx, {
+    questions,
+    betweenQuestionsSeconds: 1,
+  });
+
+  await waitFor(async () => (await store.listQuestionSends(game.id, 0)).length === 2);
+  const sends1 = await store.listQuestionSends(game.id, 0);
+  answer(ctx, sends1.find((s) => s.player_jid === PLAYER), "Paris");
+  answer(ctx, sends1.find((s) => s.player_jid === PLAYER2), "Paris");
+
+  await waitFor(async () =>
+    sock.sent.some((s) => s.jid === GROUP && /after Q1\/2/.test(s.content?.text ?? ""))
+  );
+  const leaderboard = sock.sent.find(
+    (s) => s.jid === GROUP && /after Q1\/2/.test(s.content?.text ?? "")
+  );
+
+  await waitFor(async () =>
+    sock.sent.some((s) => s.jid === GROUP && (s.content?.text ?? "").includes("Q2/2"))
+  );
+  const q2Text = sock.sent.find(
+    (s) => s.jid === GROUP && (s.content?.text ?? "").includes("Q2/2")
+  );
+  assert.ok(
+    q2Text.at - leaderboard.at >= 900,
+    "the configured pause elapses between the leaderboard and the next question"
+  );
+  assert.equal((await store.getGameRow(game.id)).advance_mode, "auto");
 });

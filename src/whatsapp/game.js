@@ -33,14 +33,19 @@ import {
   voteIndexes,
 } from "./poll-crypto.js";
 import {
+  ADVANCE_MODES,
   DEFAULT_BATCH_SIZE,
+  DEFAULT_BETWEEN_QUESTIONS_SECONDS,
+  DEFAULT_GROUP_TO_DM_DELAY_SECONDS,
   DEFAULT_MAX_DELAY,
   DEFAULT_MIN_DELAY,
+  DM_QUESTION_VISIBILITY,
   pollName,
 } from "../db/game.js";
 
-/** `.start <password>` (optionally `.start@1234 password`). */
+/** `.start <password>` / `.next` (optionally `.start@1234 password`). */
 const START_COMMAND = /^\.start(?:@\S+)?(?:\s+(.+))?$/i;
+const NEXT_COMMAND = /^\.next(?:@\S+)?(?:\s+(.+))?$/i;
 /** WhatsApp status code for a delivery receipt. */
 const DELIVERY_ACK = 3;
 /** Extra window (ms) a player has after their personal limit before 0 points. */
@@ -101,6 +106,56 @@ function displayName(name, jid) {
   return trimmed || jidUser(jid) || "Player";
 }
 
+/** Effective per-question time limit (seconds): game override or sheet value. */
+function effectiveTimeLimit(game, question) {
+  const override = Number(game?.question_time_seconds ?? game?.questionTimeSeconds);
+  if (Number.isFinite(override) && override > 0) return Math.round(override);
+  const sheet = Number(question?.timeLimit);
+  if (Number.isFinite(sheet) && sheet > 0) return Math.round(sheet);
+  return 20;
+}
+
+/** Pause (ms) after a question's results before auto-advancing. */
+function advanceDelayMs(game, fallbackMs) {
+  const seconds = Number(game?.between_questions_seconds ?? game?.betweenQuestionsSeconds);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds) * 1000;
+  if (Number.isFinite(fallbackMs)) return Math.max(0, fallbackMs);
+  return DEFAULT_BETWEEN_QUESTIONS_SECONDS * 1000;
+}
+
+/** Pause (ms) between the group question text and the DM answer polls. */
+function groupToDmDelayMs(game) {
+  const seconds = Number(game?.group_to_dm_delay_seconds ?? game?.groupToDmDelaySeconds);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds) * 1000;
+  return DEFAULT_GROUP_TO_DM_DELAY_SECONDS * 1000;
+}
+
+/** True when the game waits for `.next` instead of auto-advancing. */
+function isManualAdvance(game) {
+  const mode = game?.advance_mode ?? game?.advanceMode ?? "auto";
+  return mode === "manual";
+}
+
+/** DM poll question line: number only when hidden, number + text when shown. */
+function dmPollName(game, question, index) {
+  const label = `Q${index + 1}`;
+  const visibility =
+    game?.dm_question_visibility ?? game?.dmQuestionVisibility ?? "shown";
+  if (visibility === "hidden") return pollName(label);
+  const text = typeof question?.question === "string" ? question.question : "";
+  return pollName(text ? `${label}: ${text}` : label);
+}
+
+/** Group announcement for a question: number + full text + lettered options. */
+function groupQuestionText(question, index, total) {
+  const letters = ["A", "B", "C", "D", "E", "F"];
+  const options = (question?.options ?? []).map(
+    (option, i) => `${letters[i] ?? `${i + 1}.`} ${option}`
+  );
+  const head = `❓ *Q${index + 1}/${total}*\n${question?.question ?? ""}`;
+  return options.length ? `${head}\n${options.join("\n")}` : head;
+}
+
 /**
  * Builds the RoninClash engine. Returns
  * `{ stop, schedule, cancel, resume, handleMessage, handlePollVote, handleReceipt }`
@@ -115,14 +170,22 @@ export function createGameEngine({
   intraBatchJitterMs = INTRA_BATCH_JITTER_MS,
 } = {}) {
   if (!connection || !store) return null;
+  const defaultAdvanceMs = betweenQuestionsMs;
 
-  /** gameId -> { chain, watch, timers:Set, closed:Set } */
+  /** gameId -> { chain, watch, timers:Set, closed:Set, held:{index}|null } */
   const runtimes = new Map();
 
   function runtime(gameId) {
     let rt = runtimes.get(gameId);
     if (!rt) {
-      rt = { chain: Promise.resolve(), watch: null, timers: new Set(), closed: new Set() };
+      rt = {
+        chain: Promise.resolve(),
+        watch: null,
+        timers: new Set(),
+        closed: new Set(),
+        // Manual advance: set when a question closed and waits for `.next`.
+        held: null,
+      };
       runtimes.set(gameId, rt);
     }
     return rt;
@@ -149,6 +212,21 @@ export function createGameEngine({
     }, Math.max(0, ms));
     rt.timers.add(timer);
     return timer;
+  }
+
+  /**
+   * A sleep registered on the runtime's timer set, so stop()/cancel() clears it
+   * mid-delay and a pending question flow never sends after shutdown.
+   */
+  function trackedSleep(gameId, ms) {
+    return new Promise((resolve) => {
+      const rt = runtime(gameId);
+      const timer = setTimeout(() => {
+        rt.timers.delete(timer);
+        resolve();
+      }, Math.max(0, ms));
+      rt.timers.add(timer);
+    });
   }
 
   function emitGame(gameId, action, extra = {}) {
@@ -210,7 +288,7 @@ export function createGameEngine({
     const result = await sendDm(
       game,
       player.jid,
-      { question: pollName(question.question), options, selectableCount },
+      { question: dmPollName(game, question, index), options, selectableCount },
       { poll: true }
     );
     const pollId = result?.key?.id;
@@ -241,6 +319,13 @@ export function createGameEngine({
       minDelaySeconds: valid.minDelaySeconds ?? DEFAULT_MIN_DELAY,
       maxDelaySeconds: valid.maxDelaySeconds ?? DEFAULT_MAX_DELAY,
       batchSize: valid.batchSize ?? DEFAULT_BATCH_SIZE,
+      questionTimeSeconds: valid.questionTimeSeconds ?? null,
+      betweenQuestionsSeconds:
+        valid.betweenQuestionsSeconds ?? DEFAULT_BETWEEN_QUESTIONS_SECONDS,
+      advanceMode: valid.advanceMode ?? "auto",
+      groupToDmDelaySeconds:
+        valid.groupToDmDelaySeconds ?? DEFAULT_GROUP_TO_DM_DELAY_SECONDS,
+      dmQuestionVisibility: valid.dmQuestionVisibility ?? "shown",
       questions: valid.questions,
       hostJid: valid.hostJid ?? ownAccountJid(connection),
       status: "scheduled",
@@ -466,7 +551,7 @@ export function createGameEngine({
     });
   }
 
-  /** Sends every player the current question (batched) and starts the watch. */
+  /** Opens a question: group text first, then the batched DM polls, then watch. */
   async function openQuestion(gameId, index) {
     const game = await store.getGameRow(gameId);
     if (!game || game.status !== "running") return;
@@ -474,6 +559,8 @@ export function createGameEngine({
     if (index >= questions.length) return finishGame(gameId);
     const question = questions[index];
     await store.updateGame(gameId, { questionIndex: index });
+    const rt = runtime(gameId);
+    rt.held = null;
 
     const players = await store.listGamePlayers(gameId);
     const alreadySent = new Set(
@@ -485,13 +572,25 @@ export function createGameEngine({
     const maxDelay = Number(game.max_delay_seconds) || DEFAULT_MAX_DELAY;
 
     // Spec: right after registration locks, the group is told "First question
-    // sent" — posted before the DM batches go out.
+    // sent" — posted before the question itself goes out.
     if (index === 0) {
       await sendGroup(
         { group_jid: game.group_jid },
         { text: "✅ *First question sent* — check your DM!" }
       );
     }
+
+    // Group-first flow: the full question (text + lettered options) lands in
+    // the group so everyone reads it together before any DM poll arrives.
+    await sendGroup(
+      { group_jid: game.group_jid },
+      { text: groupQuestionText(question, index, questions.length) }
+    );
+
+    // The configured reading pause before the DMs. Tracked so stop()/cancel()
+    // cancels it mid-delay instead of letting the flow send after shutdown.
+    const groupToDmMs = groupToDmDelayMs(game);
+    if (groupToDmMs > 0) await trackedSleep(gameId, groupToDmMs);
 
     for (let i = 0; i < pending.length; i += batchSize) {
       const batch = pending.slice(i, i + batchSize);
@@ -541,6 +640,8 @@ export function createGameEngine({
 
   /** True once the question should close (deadline passed, or all answered). */
   async function maybeCloseQuestion(gameId, index, question) {
+    const game = await store.getGameRow(gameId);
+    if (!game || game.status !== "running") return true;
     const players = await store.listGamePlayers(gameId);
     if (!players.length) return true;
     const sends = await store.listQuestionSends(gameId, index);
@@ -548,7 +649,7 @@ export function createGameEngine({
     const byJid = new Map(sends.map((s) => [s.player_jid, s]));
     const answers = await store.listAnswers(gameId, index);
     const answered = new Set(answers.filter((a) => a.selected.length).map((a) => a.playerJid));
-    const limitMs = Math.max(1, Number(question.timeLimit) || 20) * 1000;
+    const limitMs = effectiveTimeLimit(game, question) * 1000;
 
     const now = Date.now();
     let maxDeadline = 0;
@@ -583,7 +684,7 @@ export function createGameEngine({
     const byJid = new Map(sends.map((s) => [s.player_jid, s]));
     const answers = await store.listAnswers(gameId, index);
     const answersByJid = new Map(answers.map((a) => [a.playerJid, a]));
-    const limit = Math.max(1, Number(question.timeLimit) || 20);
+    const limit = effectiveTimeLimit(game, question);
     const correctText = (question.correct ?? []).map((i) => question.options[i]).join(", ");
 
     for (const player of players) {
@@ -642,7 +743,22 @@ export function createGameEngine({
 
     await store.closeQuestionSends(gameId, index);
     await postLeaderboard(game, index);
-    later(gameId, () => advance(gameId, index), betweenQuestionsMs);
+    if (isManualAdvance(game)) {
+      // Hold: the next question waits for the host/group admin to send `.next`
+      // (or press "Next question" in the dashboard).
+      rt.held = { index };
+      await sendGroup(
+        { group_jid: game.group_jid },
+        {
+          text:
+            "⏸ *Question complete* — the next question is waiting. " +
+            "The host or a group admin sends `.next` to continue.",
+        }
+      );
+      emitGame(gameId, "held", { questionIndex: index });
+    } else {
+      later(gameId, () => advance(gameId, index), advanceDelayMs(game, betweenQuestionsMs));
+    }
   }
 
   /** Posts the top-5 leaderboard to the group. */
@@ -657,7 +773,7 @@ export function createGameEngine({
     const total = (game.questions ?? []).length;
     await sendGroup(
       { group_jid: game.group_jid },
-      { text: `🏆 *Leaderboard* (after Q${index + 1}/${total})\n${lines.join("\n")}` }
+      { text: `🏆 *Leaderboard* (after Q${index + 1}/${total})\n\n${lines.join("\n")}` }
     );
     emitGame(game.id, "leaderboard", { questionIndex: index });
   }
@@ -733,15 +849,20 @@ export function createGameEngine({
 
   /* ------------------------------ host start ----------------------------- */
 
-  /** Handles a `.start <password>` group message. */
+  /** Handles `.start <password>` / `.next` group messages. */
   async function handleMessage(message) {
     if (!message?.isGroup || message.fromMe) return;
     if (!message.chat) return;
     const text = typeof message.text === "string" ? message.text.trim() : "";
-    const match = START_COMMAND.exec(text);
-    if (!match) return;
-    const password = (match[1] ?? "").trim();
-    await enqueue(message.chat, () => startFromCommand(message, password));
+    const start = START_COMMAND.exec(text);
+    if (start) {
+      const password = (start[1] ?? "").trim();
+      await enqueue(message.chat, () => startFromCommand(message, password));
+      return;
+    }
+    if (NEXT_COMMAND.test(text)) {
+      await enqueue(message.chat, () => nextFromCommand(message));
+    }
   }
 
   /**
@@ -814,6 +935,79 @@ export function createGameEngine({
     emitGame(lobby.id, "started", { playerCount: players.length });
     later(lobby.id, () => openQuestion(lobby.id, 0), startDelayMs);
     return { ok: true, gameId: lobby.id };
+  }
+
+  /* --------------------------- manual advance ---------------------------- */
+
+  /**
+   * Core manual advance: opens the question after the one held at close time
+   * (see closeQuestion). Must run inside the game's enqueue.
+   */
+  async function runHeldAdvance(gameId) {
+    const rt = runtime(gameId);
+    const held = rt.held;
+    if (!held) return { ok: false, reason: "not-held" };
+    rt.held = null;
+    await advance(gameId, held.index);
+    return { ok: true, gameId };
+  }
+
+  /**
+   * Programmatic manual advance for the dashboard's "Next question" button
+   * (`PATCH /api/games/:id { action: "next" }`). Returns `{ ok, reason }`.
+   */
+  function advanceManual(gameId) {
+    return enqueue(gameId, async () => {
+      const game = await store.getGameRow(gameId);
+      if (!game || game.status !== "running") return { ok: false, reason: "status" };
+      return runHeldAdvance(gameId);
+    });
+  }
+
+  /**
+   * Validates a `.next` command and, when allowed, advances a manually-held
+   * game. Only the host or a group admin may advance (same rule as `.start`).
+   * Returns a `{ ok, reason }` result (exposed for tests).
+   */
+  async function nextFromCommand(message) {
+    let candidates = [];
+    try {
+      candidates = (await store.listActiveGames()).filter(
+        (g) => g.status === "running" && g.group_jid === message.chat
+      );
+    } catch (err) {
+      connection.emit?.("failure", err);
+      return { ok: false, reason: "storage" };
+    }
+    const game = candidates[0];
+    if (!game) return { ok: false, reason: "no-game" };
+
+    const sender = bareJid(message.sender ?? "");
+    const isHost = Boolean(game.host_jid && sender && bareJid(game.host_jid) === sender);
+    let isAdmin = false;
+    try {
+      isAdmin = connection.participantIsAdmin
+        ? await connection.participantIsAdmin(game.group_jid, sender)
+        : false;
+    } catch {
+      isAdmin = false;
+    }
+    if (!isHost && !isAdmin) {
+      await sendGroup(
+        { group_jid: game.group_jid },
+        { text: "❌ Only the host or a group admin can advance to the next question." }
+      );
+      return { ok: false, reason: "not-allowed" };
+    }
+
+    const result = await runHeldAdvance(game.id);
+    if (!result.ok && result.reason === "not-held") {
+      await sendGroup(
+        { group_jid: game.group_jid },
+        { text: "⏳ Nothing to advance yet — wait for the current question to finish." }
+      );
+    }
+    return result;
   }
 
   /* ------------------------------- events -------------------------------- */
@@ -916,5 +1110,7 @@ export function createGameEngine({
     handlePollVote,
     handleReceipt,
     startFromCommand,
+    nextFromCommand,
+    advanceManual,
   };
 }
