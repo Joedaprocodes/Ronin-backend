@@ -742,7 +742,13 @@ export function createGameEngine({
     }
 
     await store.closeQuestionSends(gameId, index);
-    await postLeaderboard(game, index);
+    // Fresh re-read so marks are restart-safe: only players who selected
+    // something get ✅/❌, non-voters stay blank.
+    const fresh = await store.listAnswers(gameId, index);
+    const correctByJid = new Map(
+      fresh.filter((a) => (a.selected ?? []).length > 0).map((a) => [a.playerJid, a.correct === true])
+    );
+    await postLeaderboard(game, index, correctByJid);
     if (isManualAdvance(game)) {
       // Hold: the next question waits for the host/group admin to send `.next`
       // (or press "Next question" in the dashboard).
@@ -761,14 +767,18 @@ export function createGameEngine({
     }
   }
 
-  /** Posts the top-5 leaderboard to the group. */
-  async function postLeaderboard(game, index) {
+  /** Posts the top-5 leaderboard to the group, ending each name with the
+   * player's mark on the last answered question (✅ right, ❌ wrong;
+   * blank when they selected nothing). */
+  async function postLeaderboard(game, index, correctByJid = new Map()) {
     const players = await store.listGamePlayers(game.id);
     if (!players.length) return;
     const medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"];
     const lines = players.slice(0, 5).map((p, i) => {
       const rank = medals[i] ?? `${i + 1}.`;
-      return `${rank} ${displayName(p.name, p.jid)} — ${p.points} pts`;
+      const flag = correctByJid.get(p.jid);
+      const mark = flag === undefined ? "" : flag ? " ✅" : " ❌";
+      return `${rank} ${displayName(p.name, p.jid)}${mark} — ${p.points} pts`;
     });
     const total = (game.questions ?? []).length;
     await sendGroup(

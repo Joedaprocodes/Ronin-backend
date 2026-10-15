@@ -789,3 +789,26 @@ test("auto mode waits the game's between-questions pause before the next questio
   );
   assert.equal((await store.getGameRow(game.id)).advance_mode, "auto");
 });
+
+test("leaderboard marks ✅/❌ after names, blank when a player did not answer", async () => {
+  __reset();
+  const ctx = await setup({ startDelayMs: 10, betweenQuestionsMs: 20, intraBatchJitterMs: 0 });
+  const { store, sock } = ctx;
+  const { game } = await startTwoPlayerGame(ctx, { questions: [QUESTION] });
+
+  await waitFor(async () => (await store.listQuestionSends(game.id, 0)).length === 2);
+  const sends = await store.listQuestionSends(game.id, 0);
+  // Ada answers correctly; Bo selects nothing (stays blank).
+  answer(ctx, sends.find((s) => s.player_jid === PLAYER), "Paris");
+
+  await waitFor(async () =>
+    sock.sent.some((s) => s.jid === GROUP && /after Q1\/1/.test(s.content?.text ?? ""))
+  );
+  const board = sock.sent.find(
+    (s) => s.jid === GROUP && /after Q1\/1/.test(s.content?.text ?? "")
+  );
+  const text = board.content?.text ?? "";
+  assert.ok(/Ada ✅/.test(text), "correct voter gets ✅");
+  const boLine = text.split("\n").find((l) => l.includes("Bo"));
+  assert.ok(boLine && !/[✅❌]/.test(boLine), "non-voter stays blank");
+});
