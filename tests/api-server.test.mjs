@@ -304,9 +304,9 @@ test("OPTIONS preflight and health check", async () => {
     assert.equal(pre.status, 204);
     assert.equal(pre.headers.get("access-control-allow-origin"), "*");
     // The browser preflight must advertise every method the API serves, or
-    // fetch() rejects PUT/DELETE before the request is even sent.
+    // fetch() rejects PUT/PATCH/DELETE before the request is even sent.
     const methods = pre.headers.get("access-control-allow-methods");
-    for (const m of ["GET", "POST", "PUT", "DELETE", "OPTIONS"]) {
+    for (const m of ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
       assert.ok(methods.includes(m), `preflight advertises ${m}`);
     }
 
