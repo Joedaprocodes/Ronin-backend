@@ -314,26 +314,26 @@ export class WhatsAppConnection extends EventEmitter {
           // rather than stored as a (blank) chat message.
           const pollUpdate = msg.message?.pollUpdateMessage ?? content?.pollUpdateMessage;
           if (pollUpdate) {
-            // The jid WhatsApp used inside the encrypted vote signature is
-            // Baileys' getKeyAuthor: key.participantAlt || key.remoteJidAlt ||
-            // key.participant || key.remoteJid (device-stripped). Provide that
-            // first, plus the next unused form as a decryption fallback.
-            const candidates = [
+            // The jid WhatsApp signed inside the encrypted vote is Baileys'
+            // getKeyAuthor order: participantAlt → remoteJidAlt → participant
+            // → remoteJid — possibly with a device suffix. Expose every
+            // spelling (raw + device-stripped) so decryption can try them all;
+            // voterJid/voterJidAlt keep the first two for compatibility.
+            const rawCandidates = [
               msg.key.participantAlt,
               msg.key.remoteJidAlt,
               msg.key.participant,
               msg.key.remoteJid,
-            ]
-              .filter(Boolean)
-              .map((j) => bareJid(j));
-            const [voterJid = null, voterJidAlt = null] = [...new Set(candidates)];
+            ].filter(Boolean);
+            const unique = [...new Set(rawCandidates.flatMap((j) => [j, bareJid(j)]))];
             this.emit("pollVote", {
               pollMessageId: pollUpdate.pollCreationMessageKey?.id ?? null,
               pollUpdateMessage: pollUpdate,
               chat: remoteJid,
               isGroup: isGroupJid(remoteJid),
-              voterJid,
-              voterJidAlt,
+              voterJid: unique[0] ?? null,
+              voterJidAlt: unique[1] ?? null,
+              voterCandidates: unique,
               voterName: msg.pushName ?? null,
               rawKey: msg.key,
               receivedAt: Date.now(),

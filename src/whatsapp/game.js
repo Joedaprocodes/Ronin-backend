@@ -24,9 +24,14 @@
  * lobby open and resumes a running question without double-sending.
  */
 
-import { decryptPollVote, sha256 } from "@whiskeysockets/baileys";
 import { calcScore, elapsedSeconds, isCorrect, questionStartMs } from "./scoring.mjs";
 import { bareJid, identityPair } from "./identity.js";
+import {
+  creatorCandidates,
+  decryptVoteWithCandidates,
+  voterCandidates,
+  voteIndexes,
+} from "./poll-crypto.js";
 import {
   DEFAULT_BATCH_SIZE,
   DEFAULT_MAX_DELAY,
@@ -84,20 +89,6 @@ function jidUser(jid) {
 function displayName(name, jid) {
   const trimmed = typeof name === "string" ? name.trim() : "";
   return trimmed || jidUser(jid) || "Player";
-}
-
-/**
- * Maps a decrypted vote ({ selectedOptions: [{ name: <sha256> }] }) onto the
- * question's option indexes. WhatsApp sends the SHA-256 of each chosen option.
- */
-function voteIndexes(question, vote) {
-  const wanted = new Set((vote?.selectedOptions ?? []).map((o) => o?.name).filter(Boolean));
-  const out = [];
-  (question.options ?? []).forEach((option, index) => {
-    const hash = sha256(Buffer.from(String(option))).toString();
-    if (wanted.has(hash)) out.push(index);
-  });
-  return out;
 }
 
 /**
@@ -313,56 +304,76 @@ export function createGameEngine({
 
   /* --------------------------- registration votes ------------------------ */
 
-  /** Decrypts a poll vote, trying the primary then the alternate voter jid. */
-  function decryptVote(pollUpdate, { pollMsgId, pollCreatorJid, pollEncKey, voters }) {
-    const vote = pollUpdate?.vote;
-    if (!vote) return null;
-    for (const voterJid of voters) {
-      if (!voterJid) continue;
-      try {
-        return decryptPollVote(
-          { encPayload: vote.encPayload, encIv: vote.encIv },
-          { pollCreatorJid, pollMsgId, pollEncKey, voterJid }
-        );
-      } catch {
-        // wrong jid form; try the next candidate
-      }
-    }
-    return null;
-  }
-
-  /** The PN form of a voter when one is available (most reliable for DMs). */
+  /** The device-stripped voter jid for storage/DMs: prefer a PN form. */
   function preferredPlayerJid(voters) {
-    for (const jid of voters) {
+    const unique = [...new Set((voters ?? []).filter(Boolean).map((jid) => bareJid(jid)))];
+    for (const jid of unique) {
       if (identityPair(jid, null).pn) return jid;
     }
-    return voters.find(Boolean) ?? null;
+    return unique[0] ?? null;
+  }
+
+  /** Decryption candidates for one vote: key fields (raw+bare) + extras. */
+  function voteCandidates(event) {
+    return voterCandidates(event.rawKey, [
+      event.voterJid,
+      event.voterJidAlt,
+      ...(event.voterCandidates ?? []),
+    ]);
   }
 
   /** Handles a vote on a game's join poll. */
   async function handleJoinVote(game, event) {
-    const pollCreatorJid = ownAccountJid(connection);
+    const ownJid = ownAccountJid(connection);
+    const ownRaw = connection?.user?.id ?? connection?.sock?.user?.id ?? null;
     const pollEncKey = game.join_message_secret
       ? Buffer.from(game.join_message_secret, "base64")
       : null;
-    if (!pollEncKey || !pollCreatorJid) return;
-    const voters = [...new Set([event.voterJid, event.voterJidAlt].filter(Boolean))];
-    const vote = decryptVote(event.pollUpdateMessage, {
+    if (!pollEncKey || !ownJid) {
+      console.warn(
+        `[game] join vote dropped for game ${game.id}: ` +
+          (pollEncKey ? "own account jid unknown" : "missing join_message_secret")
+      );
+      return;
+    }
+    const voters = voteCandidates(event);
+    const creators = creatorCandidates(
+      event.pollUpdateMessage?.pollCreationMessageKey,
+      ownJid,
+      ownRaw
+    );
+    const vote = decryptVoteWithCandidates(event.pollUpdateMessage?.vote, {
       pollMsgId: event.pollMessageId,
-      pollCreatorJid,
       pollEncKey,
+      creators,
       voters,
     });
-    if (!vote) return;
+    if (!vote) {
+      console.warn(
+        `[game] join vote decrypt FAILED poll=${event.pollMessageId} game=${game.id} ` +
+          `creators=[${creators.join(", ")}] voters=[${voters.join(", ")}]`
+      );
+      return;
+    }
     const joined = voteIndexes({ options: JOIN_OPTIONS }, vote).includes(0); // "I'm in"
     const playerJid = preferredPlayerJid(voters);
-    if (!playerJid) return;
+    if (!playerJid) {
+      console.warn(`[game] join vote has no voter jid poll=${event.pollMessageId}`);
+      return;
+    }
     if (joined) {
       await store.addGamePlayer(game.id, playerJid, event.voterName ?? null);
-      emitGame(game.id, "joined", { playerJid });
+      const count = await store.countGamePlayers(game.id);
+      console.log(
+        `[game] ${event.voterName ?? playerJid} joined "${game.title}" ` +
+          `(${count} player${count === 1 ? "" : "s"})`
+      );
+      emitGame(game.id, "joined", { playerJid, playerCount: count });
     } else {
       await store.removeGamePlayer(game.id, playerJid);
-      emitGame(game.id, "left", { playerJid });
+      const count = await store.countGamePlayers(game.id);
+      console.log(`[game] ${playerJid} left "${game.title}" (${count} players)`);
+      emitGame(game.id, "left", { playerJid, playerCount: count });
     }
   }
 
@@ -374,17 +385,35 @@ export function createGameEngine({
     if (!game || game.status !== "running") return;
     const question = (game.questions ?? [])[send.question_index];
     if (!question) return;
-    const pollCreatorJid = ownAccountJid(connection);
+    const ownJid = ownAccountJid(connection);
+    const ownRaw = connection?.user?.id ?? connection?.sock?.user?.id ?? null;
     const pollEncKey = send.poll_secret ? Buffer.from(send.poll_secret, "base64") : null;
-    if (!pollEncKey || !pollCreatorJid) return;
-    const voters = [...new Set([event.voterJid, event.voterJidAlt].filter(Boolean))];
-    const vote = decryptVote(event.pollUpdateMessage, {
+    if (!pollEncKey || !ownJid) {
+      console.warn(
+        `[game] answer vote dropped poll=${send.poll_message_id}: ` +
+          (pollEncKey ? "own account jid unknown" : "missing question_send secret")
+      );
+      return;
+    }
+    const voters = voteCandidates(event);
+    const creators = creatorCandidates(
+      event.pollUpdateMessage?.pollCreationMessageKey,
+      ownJid,
+      ownRaw
+    );
+    const vote = decryptVoteWithCandidates(event.pollUpdateMessage?.vote, {
       pollMsgId: send.poll_message_id,
-      pollCreatorJid,
       pollEncKey,
+      creators,
       voters,
     });
-    if (!vote) return;
+    if (!vote) {
+      console.warn(
+        `[game] answer decrypt FAILED poll=${send.poll_message_id} game=${send.game_id} ` +
+          `creators=[${creators.join(", ")}] voters=[${voters.join(", ")}]`
+      );
+      return;
+    }
     const selected = voteIndexes(question, vote);
     const playerJid = send.player_jid;
 
@@ -777,8 +806,9 @@ export function createGameEngine({
   async function handlePollVote(event) {
     if (!event?.pollMessageId) return;
     let joinGame = null;
+    let active = [];
     try {
-      const active = await store.listActiveGames();
+      active = await store.listActiveGames();
       for (const game of active) {
         if (game.status !== "lobby" && game.status !== "scheduled") continue;
         if (game.join_message_id && game.join_message_id === event.pollMessageId) {
@@ -795,7 +825,18 @@ export function createGameEngine({
       return;
     }
     const send = await store.getQuestionSendByPollId(event.pollMessageId);
-    if (send) await enqueue(send.game_id, () => handleAnswerVote(send, event));
+    if (send) {
+      await enqueue(send.game_id, () => handleAnswerVote(send, event));
+      return;
+    }
+    // Not one of ours — only worth a line while games are running, otherwise
+    // every unrelated poll in the bot's groups would spam the console.
+    if (active.length) {
+      console.warn(
+        `[game] vote for poll ${event.pollMessageId} matched none of ` +
+          `${active.length} active game(s)`
+      );
+    }
   }
 
   /** A delivery receipt: starts a player's personal question clock. */

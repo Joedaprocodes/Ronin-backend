@@ -36,11 +36,13 @@ async function waitFor(cond, timeout = 5000, step = 5) {
   }
 }
 
-/** sha256 hex of a poll option, as WhatsApp sends it inside a vote. */
-const hash = (text) => sha256(Buffer.from(text)).toString();
-/** A decrypted vote selecting the given option texts. */
+/**
+ * A decrypted vote selecting the given option texts. Mirrors the REAL proto
+ * shape: `PollVoteMessage.selectedOptions` is `repeated bytes` — raw
+ * sha256(optionText) digests, not `{ name }` objects.
+ */
 const vote = (...options) => ({
-  selectedOptions: options.map((o) => ({ name: hash(o) })),
+  selectedOptions: options.map((o) => sha256(Buffer.from(o))),
 });
 
 function makeAuth() {
@@ -110,7 +112,10 @@ async function join(ctx, raw, jid, name, option = "I'm in") {
   __setPollVote(raw.join_message_id, vote(option));
   ctx.wa.emit("pollVote", {
     pollMessageId: raw.join_message_id,
-    pollUpdateMessage: { vote: {} },
+    pollUpdateMessage: {
+      pollCreationMessageKey: { id: raw.join_message_id, remoteJid: GROUP, fromMe: true },
+      vote: { encPayload: Buffer.alloc(48), encIv: Buffer.alloc(12) },
+    },
     chat: GROUP,
     isGroup: true,
     voterJid: jid,
@@ -130,7 +135,10 @@ function answer(ctx, send, ...options) {
   __setPollVote(send.poll_message_id, vote(...options));
   ctx.wa.emit("pollVote", {
     pollMessageId: send.poll_message_id,
-    pollUpdateMessage: { vote: {} },
+    pollUpdateMessage: {
+      pollCreationMessageKey: { id: send.poll_message_id, fromMe: true },
+      vote: { encPayload: Buffer.alloc(48), encIv: Buffer.alloc(12) },
+    },
     chat: send.player_jid,
     isGroup: false,
     voterJid: send.player_jid,
@@ -531,4 +539,43 @@ test("multi-answer keeps the last pre-deadline selection and never reopens a fin
   assert.deepEqual(after.selected, [0, 1], "the finalized answer is unchanged");
   assert.equal(after.points, closed.points);
   assert.equal(after.seconds, closed.seconds);
+});
+
+test("a join vote arriving through messages.upsert registers the player", async () => {
+  __reset();
+  const ctx = await setup({ startDelayMs: 10, betweenQuestionsMs: 20 });
+  const { store, sock } = ctx;
+  const { raw } = await scheduleLobby(ctx, [QUESTION]);
+  __setPollVote(raw.join_message_id, vote("I'm in"));
+
+  // Real-shaped group vote: the creation key points at the join poll, the
+  // voter is the message participant, payload fields are proto byte buffers.
+  sock.ev.emit("messages.upsert", {
+    type: "notify",
+    messages: [
+      {
+        key: { id: "vote-join-1", remoteJid: GROUP, participant: PLAYER, fromMe: false },
+        pushName: "Ada",
+        message: {
+          messageContextInfo: {},
+          pollUpdateMessage: {
+            pollCreationMessageKey: {
+              id: raw.join_message_id,
+              remoteJid: GROUP,
+              fromMe: true,
+            },
+            vote: {
+              encPayload: Buffer.alloc(48),
+              encIv: Buffer.alloc(12),
+              senderTimestampMs: Date.now(),
+            },
+          },
+        },
+      },
+    ],
+  });
+
+  await waitFor(async () => (await store.getGamePlayer(raw.id, PLAYER)) !== null);
+  const player = await store.getGamePlayer(raw.id, PLAYER);
+  assert.equal(player.name, "Ada");
 });
