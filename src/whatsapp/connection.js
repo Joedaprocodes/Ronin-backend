@@ -191,6 +191,7 @@ export class WhatsAppConnection extends EventEmitter {
 
       // Credentials + keys are persisted in the auth store, so a restart reuses the session
       const { state: authState, saveCreds } = await this.auth.load();
+      this.authState = authState;
       // Fold the account's own LID and PN forms together (see #learnSelfIdentity),
       // so "message yourself" traffic doesn't split into two conversations.
       // Best-effort and idempotent: creds.me is absent before the first pairing.
@@ -392,7 +393,6 @@ export class WhatsAppConnection extends EventEmitter {
       sock.ev.on("messages.update", async (updates) => {
         if (sock !== this.sock) return;
         for (const item of updates ?? []) {
-          console.log("[wa] messages.update", JSON.stringify(updates, null, 2));
           const key = item?.key;
           const update = item?.update ?? {};
           if (!key?.id || !key.remoteJid) continue;
@@ -543,7 +543,11 @@ export class WhatsAppConnection extends EventEmitter {
       this.pairingCode = null;
       this.pairingCodeAt = 0;
       this.retries = 0;
-      this.user = { id: this.sock.user?.id ?? null, name: this.sock.user?.name ?? null };
+      this.user = {
+        id: this.sock.user?.id ?? null,
+        lid: this.sock.user?.lid ?? this.authState?.creds?.me?.lid ?? null,
+        name: this.sock.user?.name ?? null,
+      };
       this.#setState("open");
       this.emit("ready", this.user);
       // Backfill every group subject we participate in so the inbox lists show

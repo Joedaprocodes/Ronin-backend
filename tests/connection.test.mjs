@@ -52,7 +52,7 @@ test("start() connects and emits ready/open", async () => {
   assert.equal(states[0], "connecting");
   await openConnection(wa);
   assert.equal(wa.getStatus().state, "open");
-  assert.deepEqual(wa.getStatus().user, { id: "1234@s.whatsapp.net", name: "Tester" });
+  assert.deepEqual(wa.getStatus().user, { id: "1234@s.whatsapp.net", lid: null, name: "Tester" });
 });
 
 test("messages.upsert de-duplicates and extracts text", async () => {

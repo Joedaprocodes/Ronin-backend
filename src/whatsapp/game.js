@@ -70,6 +70,16 @@ function ownAccountJid(connection) {
   return typeof id === "string" ? bareJid(id) : null;
 }
 
+/** The linked account's own LID (raw, may carry a device suffix). */
+function ownAccountLid(connection) {
+  const lid =
+    connection?.user?.lid ??
+    connection?.sock?.user?.lid ??
+    connection?.authState?.creds?.me?.lid ??
+    null;
+  return typeof lid === "string" ? lid : null;
+}
+
 /** A timestamp value (Date | ISO string | ms) as milliseconds, or null. */
 function toMs(value) {
   if (value === null || value === undefined) return null;
@@ -326,6 +336,7 @@ export function createGameEngine({
   async function handleJoinVote(game, event) {
     const ownJid = ownAccountJid(connection);
     const ownRaw = connection?.user?.id ?? connection?.sock?.user?.id ?? null;
+    const ownLid = ownAccountLid(connection);
     const pollEncKey = game.join_message_secret
       ? Buffer.from(game.join_message_secret, "base64")
       : null;
@@ -340,7 +351,9 @@ export function createGameEngine({
     const creators = creatorCandidates(
       event.pollUpdateMessage?.pollCreationMessageKey,
       ownJid,
-      ownRaw
+      ownRaw,
+      ownLid ? bareJid(ownLid) : null,
+      ownLid
     );
     const vote = decryptVoteWithCandidates(event.pollUpdateMessage?.vote, {
       pollMsgId: event.pollMessageId,
@@ -387,6 +400,7 @@ export function createGameEngine({
     if (!question) return;
     const ownJid = ownAccountJid(connection);
     const ownRaw = connection?.user?.id ?? connection?.sock?.user?.id ?? null;
+    const ownLid = ownAccountLid(connection);
     const pollEncKey = send.poll_secret ? Buffer.from(send.poll_secret, "base64") : null;
     if (!pollEncKey || !ownJid) {
       console.warn(
@@ -399,7 +413,9 @@ export function createGameEngine({
     const creators = creatorCandidates(
       event.pollUpdateMessage?.pollCreationMessageKey,
       ownJid,
-      ownRaw
+      ownRaw,
+      ownLid ? bareJid(ownLid) : null,
+      ownLid
     );
     const vote = decryptVoteWithCandidates(event.pollUpdateMessage?.vote, {
       pollMsgId: send.poll_message_id,

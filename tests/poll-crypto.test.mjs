@@ -117,6 +117,33 @@ test("creator candidates cover fromMe and device-suffixed own jids", () => {
   assert.ok(tryDecrypt(enc, fromKey, ["2002@lid"]));
 });
 
+test("decrypts DM votes signed with the bot LID (not the PN)", () => {
+  const BOT_LID = "50153088094314@lid";
+  const BOT_PN = "2348146858279@s.whatsapp.net";
+  // A DM poll is LID-addressed, so WhatsApp signs the vote with the bot's
+  // LID as pollCreatorJid — the exact failure seen live:
+  // creators=[...PN..., playerLID] with no bot LID -> decrypt FAILED.
+  const enc = encryptPollVote(
+    { pollMsgId: POLL_ID, pollCreatorJid: BOT_LID, voterJid: "225159969521788@lid", pollEncKey: ENC_KEY },
+    [digest("Paris")]
+  );
+  const pnOnly = creatorCandidates({ fromMe: true }, BOT_PN, "2348146858279:12@s.whatsapp.net");
+  assert.ok(!pnOnly.includes(BOT_LID), "PN-only candidates miss the LID");
+  assert.equal(tryDecrypt(enc, pnOnly, ["225159969521788@lid"]), null, "PN-only fails like live");
+
+  const withLid = creatorCandidates(
+    { fromMe: true },
+    BOT_PN,
+    "2348146858279:12@s.whatsapp.net",
+    BOT_LID,
+    "50153088094314:12@lid"
+  );
+  assert.ok(withLid.includes(BOT_LID), "LID is tried");
+  const vote = tryDecrypt(enc, withLid, ["225159969521788@lid"]);
+  assert.ok(vote, "LID-signed DM vote decrypts once the bot LID is a candidate");
+  assert.deepEqual(voteIndexes({ options: ["Paris", "Rome", "Berlin"] }, vote), [0]);
+});
+
 test("returns null (never throws) when no candidate matches", () => {
   const enc = encryptPollVote(
     { pollMsgId: POLL_ID, pollCreatorJid: CREATOR, voterJid: "7777@lid", pollEncKey: ENC_KEY },

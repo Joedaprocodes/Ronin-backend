@@ -56,12 +56,22 @@ export function voterCandidates(rawKey, extras = []) {
 /**
  * Ordered creator-jid candidates from the poll CREATION message key plus the
  * linked account's own jids (`ownJid` bare, `ownJidRaw` with any device
- * suffix). `getKeyAuthor` uses meId when the creation key is fromMe (our
- * polls), otherwise its participant/remote fields — every spelling is tried,
- * cheapest-first.
+ * suffix, `ownLid`/`ownLidRaw` likewise). `getKeyAuthor` uses meId when the
+ * creation key is fromMe (our polls), otherwise its participant/remote
+ * fields — every spelling is tried, cheapest-first.
+ *
+ * DM polls are LID-addressed, so WhatsApp signs them with the bot's LID
+ * (e.g. `50153088094314@lid`) while group polls use the PN
+ * (`2348...@s.whatsapp.net`). Both must be tried or DM votes never decrypt.
  */
-export function creatorCandidates(creationKey, ownJid, ownJidRaw = null) {
-  const ownForms = jidForms([ownJid, ownJidRaw].filter(Boolean));
+export function creatorCandidates(
+  creationKey,
+  ownJid,
+  ownJidRaw = null,
+  ownLid = null,
+  ownLidRaw = null
+) {
+  const ownForms = jidForms([ownJid, ownJidRaw, ownLid, ownLidRaw].filter(Boolean));
   const fromKey = KEY_AUTHOR_ORDER.map((field) => creationKey?.[field]).filter(Boolean);
   return jidForms(creationKey?.fromMe ? [...ownForms, ...fromKey] : [...fromKey, ...ownForms]);
 }
