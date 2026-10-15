@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import makeWASocket, {
   Browsers,
   DEF_MEDIA_HOST,
@@ -204,6 +204,31 @@ export class WhatsAppConnection extends EventEmitter {
           keys: makeCacheableSignalKeyStore(authState.keys, this.logger),
         },
         logger: this.logger,
+        // Poll votes are only decryptable with the messageSecret of the poll
+        // *creation* message. We persist that secret when we send a question
+        // poll (see sendPoll), but Baileys also asks for the original message
+        // by key — e.g. after a restart, or for polls we didn't send. Serve it
+        // from the message store so decryption still works.
+        getMessage: async (key) => {
+          const store = this.messageStore;
+          if (!store || typeof store.getMessageRaw !== "function") return undefined;
+          if (!key?.remoteJid || !key?.id) return undefined;
+          try {
+            const found = await store.getMessageRaw(key.remoteJid, key.id);
+            if (!found) return undefined;
+            return {
+              key: found.key ?? {
+                remoteJid: key.remoteJid,
+                id: key.id,
+                fromMe: Boolean(key.fromMe),
+              },
+              message: found.message ?? undefined,
+            };
+          } catch (err) {
+            this.emit("failure", err);
+            return undefined;
+          }
+        },
         // A canonical browser tuple. WhatsApp's pairing-code `companion_hello`
         // validator rejects custom OS labels (e.g. "Campaign Server") with a
         // 400 bad-request while Baileys still returns a (dead) code — the phone
@@ -283,6 +308,38 @@ export class WhatsAppConnection extends EventEmitter {
             });
             continue;
           }
+          // RoninClash poll votes: a player answering a question (or the join
+          // poll). These carry an encrypted payload that needs the poll's
+          // messageSecret to decrypt, so they are handed to the game engine
+          // rather than stored as a (blank) chat message.
+          const pollUpdate = msg.message?.pollUpdateMessage ?? content?.pollUpdateMessage;
+          if (pollUpdate) {
+            // The jid WhatsApp used inside the encrypted vote signature is
+            // Baileys' getKeyAuthor: key.participantAlt || key.remoteJidAlt ||
+            // key.participant || key.remoteJid (device-stripped). Provide that
+            // first, plus the next unused form as a decryption fallback.
+            const candidates = [
+              msg.key.participantAlt,
+              msg.key.remoteJidAlt,
+              msg.key.participant,
+              msg.key.remoteJid,
+            ]
+              .filter(Boolean)
+              .map((j) => bareJid(j));
+            const [voterJid = null, voterJidAlt = null] = [...new Set(candidates)];
+            this.emit("pollVote", {
+              pollMessageId: pollUpdate.pollCreationMessageKey?.id ?? null,
+              pollUpdateMessage: pollUpdate,
+              chat: remoteJid,
+              isGroup: isGroupJid(remoteJid),
+              voterJid,
+              voterJidAlt,
+              voterName: msg.pushName ?? null,
+              rawKey: msg.key,
+              receivedAt: Date.now(),
+            });
+            continue;
+          }
           if (msg.key.id && !this.#isNewMessage(msg.key.id)) continue; // skip redeliveries
 
           const isGroup = isGroupJid(remoteJid);
@@ -341,6 +398,19 @@ export class WhatsAppConnection extends EventEmitter {
           if (!key?.id || !key.remoteJid) continue;
           if (key.remoteJid === "status@broadcast" || isChannelJid(key.remoteJid))
             continue;
+          // Delivery/read receipts (status changes) carry no message. RoninClash
+          // uses the DELIVERY_ACK to start a player's personal question clock,
+          // so surface every status change as a "receipt" event.
+          if (typeof update.status === "number") {
+            this.emit("receipt", {
+              id: key.id,
+              chat: key.remoteJid,
+              fromMe: Boolean(key.fromMe),
+              participant: key.participant ?? null,
+              status: update.status,
+              receivedAt: Date.now(),
+            });
+          }
           if (!("message" in update)) continue; // receipts/status changes carry no message
           const next = update.message;
           if (next === null) {
@@ -690,6 +760,39 @@ export class WhatsAppConnection extends EventEmitter {
     });
     this.emit("message", persisted);
     return { ...result, persisted };
+  }
+
+  /**
+   * Sends a WhatsApp poll and returns `{ key, messageSecret }`.
+   *
+   * `messageSecret` is a 32-byte Buffer that WhatsApp uses to encrypt each
+   * vote; without it a vote cannot be decrypted later. Callers that need to
+   * read the results (RoninClash) should pass a secret they persist, or store
+   * the random one returned here. `selectableCount` is how many options a voter
+   * may pick — 1 for single-answer, `options.length` for multi-answer.
+   *
+   * Unlike sendMessage, the poll is NOT persisted as a chat message: poll votes
+   * are not normal conversations and the game engine tracks its own sends.
+   */
+  async sendPoll(jid, { question, options, selectableCount = 1, messageSecret = null } = {}) {
+    const sock = this.#requireOpen();
+    const values = (options ?? []).map((o) => String(o));
+    if (!values.length) throw new Error("sendPoll requires at least one option");
+    const secret = Buffer.isBuffer(messageSecret)
+      ? messageSecret
+      : messageSecret
+        ? Buffer.from(String(messageSecret), "base64")
+        : randomBytes(32);
+    const count = Math.max(1, Math.min(values.length, Number(selectableCount) || 1));
+    const result = await sock.sendMessage(jid, {
+      poll: {
+        name: String(question ?? ""),
+        values,
+        selectableCount: count,
+        messageSecret: secret,
+      },
+    });
+    return { key: result?.key ?? null, messageSecret: secret };
   }
 
   /* ------------------------------ identities ------------------------------ */

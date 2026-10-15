@@ -1455,6 +1455,10 @@ test("pg clearAll deletes every table in one transaction", async () => {
     "auto_reply_rules",
     "away_replies",
     "away_settings",
+    "answers",
+    "question_sends",
+    "game_players",
+    "games",
   ];
 
   assert.equal(await store.clearAll(), tables.length);

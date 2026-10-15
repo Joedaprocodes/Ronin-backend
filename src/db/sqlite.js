@@ -14,6 +14,13 @@ import {
 import { contactToView, listToView, normalizePhone } from "./contacts.js";
 import { broadcastToView, recipientToView } from "./broadcasts.js";
 import {
+  gameToView,
+  gamePlayerToView,
+  newGameId,
+  answerToView,
+  GAME_COLUMNS,
+} from "./game.js";
+import {
   DEFAULT_GUARD_SETTINGS,
   guardSettingsToView,
   moderationEntryToView,
@@ -219,6 +226,60 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
       window_key text not null,
       sent_at    text not null default (datetime('now')),
       primary key (chat_jid, window_key)
+    );
+    create table if not exists games (
+      id                  text primary key,
+      title               text not null,
+      group_jid           text not null,
+      password            text not null,
+      status              text not null default 'scheduled',
+      start_at            text not null,
+      min_delay_seconds   integer not null default 8,
+      max_delay_seconds   integer not null default 25,
+      batch_size          integer not null default 10,
+      questions           text not null default '[]',
+      question_index      integer not null default 0,
+      join_message_id     text,
+      join_message_secret text,
+      host_jid            text,
+      created_at          text not null default (datetime('now')),
+      updated_at          text not null default (datetime('now'))
+    );
+    create index if not exists idx_games_status_start on games(status, start_at);
+    create index if not exists idx_games_group on games(group_jid);
+    create table if not exists game_players (
+      game_id       text not null references games(id) on delete cascade,
+      jid           text not null,
+      name          text,
+      joined_at     text not null default (datetime('now')),
+      total_points  integer not null default 0,
+      total_time_ms integer not null default 0,
+      correct_count integer not null default 0,
+      primary key (game_id, jid)
+    );
+    create table if not exists question_sends (
+      id              text primary key,
+      game_id         text not null references games(id) on delete cascade,
+      question_index  integer not null,
+      player_jid      text not null,
+      poll_message_id text not null,
+      poll_secret     text not null,
+      sent_at         text not null default (datetime('now')),
+      delivered_at    text,
+      closed_at       text
+    );
+    create unique index if not exists idx_question_sends_poll on question_sends(poll_message_id);
+    create index if not exists idx_question_sends_game_q on question_sends(game_id, question_index);
+    create table if not exists answers (
+      game_id        text not null references games(id) on delete cascade,
+      question_index integer not null,
+      player_jid     text not null,
+      selected       text not null default '[]',
+      voted_at       integer,
+      points         integer not null default 0,
+      correct        integer not null default 0,
+      seconds        real,
+      primary key (game_id, question_index, player_jid)
     );
   `);
 
@@ -1638,6 +1699,335 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
     return Boolean(selectAwayReply.get(chatJid, windowKey));
   }
 
+  // --- RoninClash games (mirrors the Postgres store) --------------------
+  //
+  // Tables: games / game_players / question_sends / answers. `questions`,
+  // `selected` and the row views line up with src/db/messages.js so the engine
+  // is store-agnostic. start_at / joined_at are ISO strings; ISO-8601 compares
+  // correctly lexicographically, so `start_at <= ?` works for due checks.
+
+  const selectGameById = db.prepare("select * from games where id = ?");
+  const selectGamePlayerCount = db.prepare(
+    "select count(*) as count from game_players where game_id = ?"
+  );
+
+  function parseJsonColumn(value, fallback) {
+    if (value === null || value === undefined) return fallback;
+    try {
+      const parsed = JSON.parse(value);
+      return parsed ?? fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  /** Normalizes a games row (parses the questions JSON). */
+  function readGameRow(row) {
+    if (!row) return null;
+    return { ...row, questions: parseJsonColumn(row.questions, []) };
+  }
+
+  /** Player counts per game id, as a Map. */
+  function playerCounts(gameIds) {
+    const map = new Map();
+    const stmt = db.prepare("select count(*) as count from game_players where game_id = ?");
+    for (const id of (gameIds ?? []).filter(Boolean)) {
+      map.set(id, Number(stmt.get(id)?.count) || 0);
+    }
+    return map;
+  }
+
+  /** Inserts a scheduled game. Returns the public view (password masked). */
+  function createGame(game = {}) {
+    const id = game.id ?? newGameId();
+    const now = new Date().toISOString();
+    db.prepare(
+      `insert into games
+         (id, title, group_jid, password, status, start_at,
+          min_delay_seconds, max_delay_seconds, batch_size, questions,
+          question_index, host_jid, created_at, updated_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id,
+      game.title,
+      game.groupJid,
+      game.password,
+      game.status ?? "scheduled",
+      game.startAt,
+      game.minDelaySeconds ?? 8,
+      game.maxDelaySeconds ?? 25,
+      game.batchSize ?? 10,
+      JSON.stringify(game.questions ?? []),
+      game.questionIndex ?? 0,
+      game.hostJid ?? null,
+      now,
+      now
+    );
+    return gameToView(readGameRow(selectGameById.get(id)), {
+      withQuestions: true,
+      playerCount: 0,
+    });
+  }
+
+  /** Games newest-start first; filter by status and/or group. */
+  function listGames({ status = null, groupJid = null } = {}) {
+    const where = [];
+    const params = [];
+    if (status) {
+      where.push("status = ?");
+      params.push(status);
+    }
+    if (groupJid) {
+      where.push("group_jid = ?");
+      params.push(groupJid);
+    }
+    const clause = where.length ? `where ${where.join(" and ")}` : "";
+    const rows = db
+      .prepare(`select * from games ${clause} order by start_at desc, created_at desc`)
+      .all(...params);
+    const counts = playerCounts(rows.map((r) => r.id));
+    return rows.map((row) =>
+      gameToView(readGameRow(row), { playerCount: counts.get(row.id) ?? 0 })
+    );
+  }
+
+  /** One game's public view, or null. */
+  function getGame(id, { withQuestions = true } = {}) {
+    const row = readGameRow(selectGameById.get(id));
+    if (!row) return null;
+    return gameToView(row, {
+      withQuestions,
+      playerCount: Number(selectGamePlayerCount.get(id)?.count) || 0,
+    });
+  }
+
+  /** Raw game row (includes the password) for the engine. */
+  function getGameRow(id) {
+    return readGameRow(selectGameById.get(id));
+  }
+
+  /** Patches a game; only known columns are written. */
+  function updateGame(id, patch = {}) {
+    const sets = [];
+    const params = [];
+    for (const [key, column] of Object.entries(GAME_COLUMNS)) {
+      if (!(key in patch) || patch[key] === undefined) continue;
+      sets.push(`${column} = ?`);
+      params.push(key === "questions" ? JSON.stringify(patch[key] ?? []) : patch[key]);
+    }
+    if (!sets.length) return getGame(id);
+    sets.push("updated_at = ?");
+    params.push(new Date().toISOString(), id);
+    db.prepare(`update games set ${sets.join(", ")} where id = ?`).run(...params);
+    return getGame(id);
+  }
+
+  /** Convenience wrapper for status transitions. */
+  function setGameStatus(id, status) {
+    return updateGame(id, { status });
+  }
+
+  /** Deletes a game and (via cascade) its players, sends and answers. */
+  function deleteGame(id) {
+    return db.prepare("delete from games where id = ?").run(id).changes > 0;
+  }
+
+  /** Scheduled games whose start time has passed. */
+  function listGamesToStart(now = new Date()) {
+    const iso = now instanceof Date ? now.toISOString() : now;
+    return db
+      .prepare(
+        `select * from games where status = 'scheduled' and start_at <= ?
+          order by start_at asc`
+      )
+      .all(iso)
+      .map(readGameRow);
+  }
+
+  /** Games that should be re-armed after a restart. */
+  function listActiveGames() {
+    return db
+      .prepare(
+        `select * from games where status in ('scheduled','lobby','running')
+          order by start_at asc`
+      )
+      .all()
+      .map(readGameRow);
+  }
+
+  /** Registers a player (idempotent). Keeps an existing name if none given. */
+  function addGamePlayer(gameId, jid, name = null) {
+    db.prepare(
+      `insert into game_players (game_id, jid, name, joined_at)
+       values (?, ?, ?, ?)
+       on conflict (game_id, jid) do update set
+         name = coalesce(excluded.name, name)`
+    ).run(gameId, jid, name, new Date().toISOString());
+  }
+
+  /** Drops a player (e.g. they removed their "I'm in" vote). */
+  function removeGamePlayer(gameId, jid) {
+    return (
+      db.prepare("delete from game_players where game_id = ? and jid = ?").run(gameId, jid)
+        .changes > 0
+    );
+  }
+
+  /** Registered players, best score first (ties broken by lower total time). */
+  function listGamePlayers(gameId) {
+    return db
+      .prepare(
+        `select * from game_players where game_id = ?
+          order by total_points desc, total_time_ms asc, joined_at asc`
+      )
+      .all(gameId)
+      .map(gamePlayerToView);
+  }
+
+  /** One registered player's view, or null. */
+  function getGamePlayer(gameId, jid) {
+    const row = db
+      .prepare("select * from game_players where game_id = ? and jid = ?")
+      .get(gameId, jid);
+    return row ? gamePlayerToView(row) : null;
+  }
+
+  /** Number of registered players. */
+  function countGamePlayers(gameId) {
+    return Number(selectGamePlayerCount.get(gameId)?.count) || 0;
+  }
+
+  /** Adds a correct-answer result to a player's running totals. */
+  function addPlayerScore(gameId, jid, { points = 0, correct = false, timeMs = 0 } = {}) {
+    db.prepare(
+      `update game_players
+          set total_points  = total_points + ?,
+              correct_count = correct_count + ?,
+              total_time_ms = total_time_ms + ?
+        where game_id = ? and jid = ?`
+    ).run(Math.round(points) || 0, correct ? 1 : 0, Math.round(timeMs) || 0, gameId, jid);
+  }
+
+  /** Records a DM poll send (idempotent per poll_message_id). */
+  function createQuestionSend({
+    id = null,
+    gameId,
+    questionIndex,
+    playerJid,
+    pollMessageId,
+    pollSecret,
+    sentAt = null,
+  }) {
+    db.prepare(
+      `insert or ignore into question_sends
+         (id, game_id, question_index, player_jid, poll_message_id, poll_secret, sent_at)
+       values (?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id ?? randomUUID(),
+      gameId,
+      questionIndex,
+      playerJid,
+      pollMessageId,
+      pollSecret,
+      sentAt ?? new Date().toISOString()
+    );
+  }
+
+  /** Stamps the first delivery receipt for a poll send. */
+  function markQuestionSendDelivered(pollMessageId, deliveredAt = null) {
+    return (
+      db
+        .prepare(
+          `update question_sends set delivered_at = coalesce(delivered_at, ?)
+            where poll_message_id = ? and delivered_at is null`
+        )
+        .run(deliveredAt ?? new Date().toISOString(), pollMessageId).changes > 0
+    );
+  }
+
+  /** The send row a poll vote belongs to, or null. */
+  function getQuestionSendByPollId(pollMessageId) {
+    return (
+      db.prepare("select * from question_sends where poll_message_id = ?").get(pollMessageId) ??
+      null
+    );
+  }
+
+  /** A game's sends, optionally narrowed to one question. */
+  function listQuestionSends(gameId, questionIndex = null) {
+    if (questionIndex === null || questionIndex === undefined) {
+      return db.prepare("select * from question_sends where game_id = ?").all(gameId);
+    }
+    return db
+      .prepare(
+        "select * from question_sends where game_id = ? and question_index = ?"
+      )
+      .all(gameId, questionIndex);
+  }
+
+  /** Marks every send for a question closed (once). */
+  function closeQuestionSends(gameId, questionIndex, closedAt = null) {
+    db.prepare(
+      `update question_sends set closed_at = coalesce(closed_at, ?)
+        where game_id = ? and question_index = ?`
+    ).run(closedAt ?? new Date().toISOString(), gameId, questionIndex);
+  }
+
+  /** Upserts a player's answer for a question. */
+  function upsertAnswer({
+    gameId,
+    questionIndex,
+    playerJid,
+    selected = [],
+    votedAt = null,
+    points = 0,
+    correct = false,
+    seconds = null,
+  }) {
+    db.prepare(
+      `insert into answers
+         (game_id, question_index, player_jid, selected, voted_at, points, correct, seconds)
+       values (?, ?, ?, ?, ?, ?, ?, ?)
+       on conflict (game_id, question_index, player_jid) do update set
+         selected = excluded.selected,
+         voted_at = excluded.voted_at,
+         points   = excluded.points,
+         correct  = excluded.correct,
+         seconds  = excluded.seconds`
+    ).run(
+      gameId,
+      questionIndex,
+      playerJid,
+      JSON.stringify(selected ?? []),
+      votedAt,
+      Math.round(points) || 0,
+      correct ? 1 : 0,
+      seconds
+    );
+  }
+
+  /** One player's answer for a question, or null. */
+  function getAnswer(gameId, questionIndex, playerJid) {
+    const row = db
+      .prepare(
+        `select * from answers
+          where game_id = ? and question_index = ? and player_jid = ?`
+      )
+      .get(gameId, questionIndex, playerJid);
+    return row ? answerToView(row) : null;
+  }
+
+  /** A game's answers, optionally narrowed to one question. */
+  function listAnswers(gameId, questionIndex = null) {
+    const rows =
+      questionIndex === null || questionIndex === undefined
+        ? db.prepare("select * from answers where game_id = ?").all(gameId)
+        : db
+            .prepare("select * from answers where game_id = ? and question_index = ?")
+            .all(gameId, questionIndex);
+    return rows.map(answerToView);
+  }
+
   /**
    * Deletes every row from every table, in one transaction. Children go first
    * (join/recipient/log tables) so the foreign keys stay satisfied.
@@ -1665,6 +2055,10 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
       "auto_reply_rules",
       "away_replies",
       "away_settings",
+      "answers",
+      "question_sends",
+      "game_players",
+      "games",
     ];
     db.exec("begin");
     try {
@@ -1737,6 +2131,29 @@ export function createSqliteMessageStore({ file = "./data/messages.db" } = {}) {
     saveAwaySettings,
     markAwayReply,
     hasAwayReply,
+    createGame,
+    listGames,
+    getGame,
+    getGameRow,
+    updateGame,
+    setGameStatus,
+    deleteGame,
+    listGamesToStart,
+    listActiveGames,
+    addGamePlayer,
+    removeGamePlayer,
+    listGamePlayers,
+    getGamePlayer,
+    countGamePlayers,
+    addPlayerScore,
+    createQuestionSend,
+    markQuestionSendDelivered,
+    getQuestionSendByPollId,
+    listQuestionSends,
+    closeQuestionSends,
+    upsertAnswer,
+    getAnswer,
+    listAnswers,
     clearAll,
     close() {
       db.close();

@@ -15,6 +15,7 @@ import {
   validateAutoReply,
   validateAwaySettings,
 } from "../db/automation.js";
+import { validateScheduleInput } from "../db/game.js";
 import { groupInfoFromSnapshot, toGroupSnapshot } from "../whatsapp/group-snapshot.js";
 import { GROUP_SNAPSHOT_TTL_MS, PAIRING_CODE_TTL_MS } from "../whatsapp/utils.js";
 
@@ -391,6 +392,8 @@ export function createApiServer({
   broadcastStore = null,
   guardStore = null,
   automationStore = null,
+  gameEngine = null,
+  gameStore = null,
   apiToken = null,
   maxMediaBytes = DEFAULT_MAX_MEDIA_BYTES,
   eventsHeartbeatMs = EVENT_HEARTBEAT_MS,
@@ -404,6 +407,7 @@ export function createApiServer({
   const bStore = broadcastStore ?? messageStore;
   const gStore = guardStore ?? messageStore;
   const aStore = automationStore ?? messageStore;
+  const gmStore = gameStore ?? messageStore;
   const JSON_HEADERS = {
     "content-type": "application/json; charset=utf-8",
     "access-control-allow-origin": "*",
@@ -508,6 +512,19 @@ export function createApiServer({
     };
     connection?.on?.("guard", onGuard);
 
+    // RoninClash lifecycle events (joined/left/question/leaderboard/finished)
+    // stream as their own frame so the Game screen can update live.
+    const onGame = (event) => {
+      if (!event || typeof event !== "object") return;
+      const frame = JSON.stringify({ type: "game", ...event });
+      try {
+        res.write(`data: ${frame}\n\n`);
+      } catch {
+        // connection dying; cleanup handles the rest
+      }
+    };
+    connection?.on?.("game", onGame);
+
     // Edits/revokes arrive as their own event (never confused with new traffic
     // by the auto-reply/guards engines) but still refresh the open thread.
     const onMessageUpdate = (msg) => {
@@ -525,6 +542,7 @@ export function createApiServer({
       clearInterval(heartbeat);
       connection?.off?.("message", onMessage);
       connection?.off?.("guard", onGuard);
+      connection?.off?.("game", onGame);
       connection?.off?.("message:update", onMessageUpdate);
     };
     req.on("close", cleanup);
@@ -1649,6 +1667,92 @@ export function createApiServer({
           const entries = await gStore.listModeration(jid, limit);
           return sendJson(res, 200, { entries });
         }
+      }
+
+      // RoninClash games. A game is one scheduled trivia round in a group: the
+      // engine posts a join poll at the start time, registers the "I'm in"
+      // voters, then (on `.start <password>`) DMs each player the questions as
+      // polls. Reads are open; writes are gated by the API token.
+      if (path === "/api/games" || path.startsWith("/api/games/")) {
+        if (
+          ["POST", "DELETE"].includes(req.method) &&
+          apiToken &&
+          !tokenMatches(req.headers["x-api-token"], apiToken)
+        ) {
+          return sendJson(res, 401, { error: "unauthorized" });
+        }
+        if (!gmStore) {
+          return sendJson(res, 503, { error: "no game store configured" });
+        }
+
+        // The group picker needs the account's groups (same shape as
+        // /api/automation/groups).
+        if (req.method === "GET" && path === "/api/games/groups") {
+          if (!connection) return sendJson(res, 503, { error: "no WhatsApp connection" });
+          if (connection.getStatus?.().state !== "open") {
+            return sendJson(res, 409, { error: "WhatsApp is not connected" });
+          }
+          if (typeof connection.listGroups !== "function") {
+            return sendJson(res, 502, { error: "groups could not be read" });
+          }
+          let all;
+          try {
+            all = await connection.listGroups();
+          } catch {
+            return sendJson(res, 502, { error: "groups could not be read" });
+          }
+          const groups = (all ?? []).map((meta) => ({
+            jid: meta.id,
+            name: typeof meta.subject === "string" && meta.subject.trim() ? meta.subject : null,
+            memberCount: Number.isInteger(meta.size) ? meta.size : (meta.participants?.length ?? 0),
+          }));
+          return sendJson(res, 200, { groups });
+        }
+
+        if (req.method === "GET" && path === "/api/games") {
+          const status = url.searchParams.get("status") ?? null;
+          const groupJid = url.searchParams.get("groupJid") ?? null;
+          const games = await gmStore.listGames({ status, groupJid });
+          return sendJson(res, 200, { games });
+        }
+
+        if (req.method === "POST" && path === "/api/games") {
+          const body = await readJson(req, res);
+          if (body === undefined) return;
+          const parsed = validateScheduleInput(body ?? {});
+          if (parsed.error) {
+            // Row-level spreadsheet errors block the confirm button client-side;
+            // echo them so the UI can point at the offending rows.
+            return sendJson(res, 400, {
+              error: parsed.error,
+              ...(parsed.rowErrors ? { rowErrors: parsed.rowErrors } : {}),
+            });
+          }
+          const game = gameEngine
+            ? await gameEngine.schedule(parsed.game)
+            : await gmStore.createGame(parsed.game);
+          return sendJson(res, 201, { ok: true, game });
+        }
+
+        const gameDetail = path.match(/^\/api\/games\/([^/]+)$/);
+        if (gameDetail) {
+          const id = decodeURIComponent(gameDetail[1]);
+          if (req.method === "GET") {
+            const game = await gmStore.getGame(id, { withQuestions: true });
+            if (!game) return sendJson(res, 404, { error: "game not found" });
+            const players = await gmStore.listGamePlayers(id);
+            return sendJson(res, 200, { game, players });
+          }
+          if (req.method === "DELETE") {
+            const removed = gameEngine
+              ? await gameEngine.cancel(id)
+              : await gmStore.deleteGame(id);
+            if (!removed) return sendJson(res, 404, { error: "game not found" });
+            return sendJson(res, 200, { ok: true, id });
+          }
+        }
+
+        return sendJson(res, 404, { error: "not found" });
       }
 
       // Automation (auto-replies + away mode) shares the dual store used for

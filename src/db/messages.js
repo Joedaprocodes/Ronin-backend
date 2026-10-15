@@ -11,6 +11,7 @@ import {
 } from "./inbox.js";
 import { contactToView, listToView, normalizePhone } from "./contacts.js";
 import { broadcastToView, recipientToView } from "./broadcasts.js";
+import { gameToView, gamePlayerToView, newGameId, GAME_COLUMNS, answerToView } from "./game.js";
 import {
   DEFAULT_GUARD_SETTINGS,
   guardSettingsToView,
@@ -60,6 +61,10 @@ export async function ensureMessageSchema(
     autoReplyGroupsTable = "auto_reply_groups",
     awaySettingsTable = "away_settings",
     awayRepliesTable = "away_replies",
+    gamesTable = "games",
+    gamePlayersTable = "game_players",
+    questionSendsTable = "question_sends",
+    gameAnswersTable = "answers",
   } = {}
 ) {
   const chatsName = qualifiedName(schema, chatsTable);
@@ -78,6 +83,10 @@ export async function ensureMessageSchema(
   const autoReplyGroupsName = qualifiedName(schema, autoReplyGroupsTable);
   const awaySettingsName = qualifiedName(schema, awaySettingsTable);
   const awayRepliesName = qualifiedName(schema, awayRepliesTable);
+  const gamesName = qualifiedName(schema, gamesTable);
+  const gamePlayersName = qualifiedName(schema, gamePlayersTable);
+  const questionSendsName = qualifiedName(schema, questionSendsTable);
+  const gameAnswersName = qualifiedName(schema, gameAnswersTable);
 
   await pool.query(`
     create table if not exists ${chatsName} (
@@ -247,6 +256,60 @@ export async function ensureMessageSchema(
       sent_at    timestamptz not null default now(),
       primary key (chat_jid, window_key)
     );
+    create table if not exists ${gamesName} (
+      id                  text        primary key,
+      title               text        not null,
+      group_jid           text        not null,
+      password            text        not null,
+      status              text        not null default 'scheduled',
+      start_at            timestamptz not null,
+      min_delay_seconds   integer     not null default 8,
+      max_delay_seconds   integer     not null default 25,
+      batch_size          integer     not null default 10,
+      questions           jsonb       not null default '[]'::jsonb,
+      question_index      integer     not null default 0,
+      join_message_id     text,
+      join_message_secret text,
+      host_jid            text,
+      created_at          timestamptz not null default now(),
+      updated_at          timestamptz not null default now()
+    );
+    create index if not exists idx_games_status_start on ${gamesName}(status, start_at);
+    create index if not exists idx_games_group on ${gamesName}(group_jid);
+    create table if not exists ${gamePlayersName} (
+      game_id        text        not null references ${gamesName}(id) on delete cascade,
+      jid            text        not null,
+      name           text,
+      joined_at      timestamptz not null default now(),
+      total_points   integer     not null default 0,
+      total_time_ms  bigint      not null default 0,
+      correct_count  integer     not null default 0,
+      primary key (game_id, jid)
+    );
+    create table if not exists ${questionSendsName} (
+      id              text        primary key,
+      game_id         text        not null references ${gamesName}(id) on delete cascade,
+      question_index  integer     not null,
+      player_jid      text        not null,
+      poll_message_id text        not null,
+      poll_secret     text        not null,
+      sent_at         timestamptz not null default now(),
+      delivered_at    timestamptz,
+      closed_at       timestamptz
+    );
+    create unique index if not exists idx_question_sends_poll on ${questionSendsName}(poll_message_id);
+    create index if not exists idx_question_sends_game_q on ${questionSendsName}(game_id, question_index);
+    create table if not exists ${gameAnswersName} (
+      game_id        text        not null references ${gamesName}(id) on delete cascade,
+      question_index integer     not null,
+      player_jid     text        not null,
+      selected       jsonb       not null default '[]'::jsonb,
+      voted_at       bigint,
+      points         integer     not null default 0,
+      correct        boolean     not null default false,
+      seconds        double precision,
+      primary key (game_id, question_index, player_jid)
+    );
     alter table ${autoReplyRulesName} add column if not exists quote boolean not null default true;
     alter table ${awaySettingsName} add column if not exists quote boolean not null default true;
     -- Runs after the guard_settings create above (ALTER needs the table to exist).
@@ -298,6 +361,10 @@ export function createPostgresMessageStore({
   autoReplyGroupsTable = "auto_reply_groups",
   awaySettingsTable = "away_settings",
   awayRepliesTable = "away_replies",
+  gamesTable = "games",
+  gamePlayersTable = "game_players",
+  questionSendsTable = "question_sends",
+  gameAnswersTable = "answers",
   autoMigrate = true,
 }) {
   const chatsName = qualifiedName(schema, chatsTable);
@@ -316,6 +383,10 @@ export function createPostgresMessageStore({
   const autoReplyGroupsName = qualifiedName(schema, autoReplyGroupsTable);
   const awaySettingsName = qualifiedName(schema, awaySettingsTable);
   const awayRepliesName = qualifiedName(schema, awayRepliesTable);
+  const gamesName = qualifiedName(schema, gamesTable);
+  const gamePlayersName = qualifiedName(schema, gamePlayersTable);
+  const questionSendsName = qualifiedName(schema, questionSendsTable);
+  const gameAnswersName = qualifiedName(schema, gameAnswersTable);
   let migrated = false;
   let identitiesBackfilled = false;
 
@@ -348,6 +419,10 @@ export function createPostgresMessageStore({
         autoReplyGroupsTable,
         awaySettingsTable,
         awayRepliesTable,
+        gamesTable,
+        gamePlayersTable,
+        questionSendsTable,
+        gameAnswersTable,
       });
       migrated = true;
       await backfillIdentities();
@@ -1715,6 +1790,374 @@ export function createPostgresMessageStore({
     return rows.length > 0;
   }
 
+  // --- RoninClash games --------------------------------------------------
+  //
+  // Four tables back the game engine: `games` (one scheduled round),
+  // `game_players` (registered "I'm in" voters + running totals),
+  // `question_sends` (one DM poll per player per question, with the
+  // messageSecret needed to decrypt their vote) and `answers` (a player's
+  // selection + score for a question). Poll sends are keyed by
+  // poll_message_id so a restart mid-batch resumes instead of double-sending.
+
+  /** Player counts per game id, as a Map (used to decorate list views). */
+  async function playerCounts(gameIds) {
+    const map = new Map();
+    const ids = (gameIds ?? []).filter(Boolean);
+    if (!ids.length) return map;
+    const { rows } = await pool.query(
+      `select game_id, count(*)::int as count from ${gamePlayersName}
+        where game_id = any($1::text[]) group by game_id`,
+      [ids]
+    );
+    for (const row of rows) map.set(row.game_id, Number(row.count) || 0);
+    return map;
+  }
+
+  /** Inserts a scheduled game. Returns the public view (password masked). */
+  async function createGame(game = {}) {
+    await ensureMigrated();
+    const id = game.id ?? newGameId();
+    const now = new Date().toISOString();
+    const { rows } = await pool.query(
+      `insert into ${gamesName}
+         (id, title, group_jid, password, status, start_at,
+          min_delay_seconds, max_delay_seconds, batch_size, questions,
+          question_index, host_jid, created_at, updated_at)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$13)
+       returning *`,
+      [
+        id,
+        game.title,
+        game.groupJid,
+        game.password,
+        game.status ?? "scheduled",
+        game.startAt,
+        game.minDelaySeconds ?? 8,
+        game.maxDelaySeconds ?? 25,
+        game.batchSize ?? 10,
+        JSON.stringify(game.questions ?? []),
+        game.questionIndex ?? 0,
+        game.hostJid ?? null,
+        now,
+      ]
+    );
+    return gameToView(rows[0], { withQuestions: true, playerCount: 0 });
+  }
+
+  /** Games newest-start first; filter by status and/or group. */
+  async function listGames({ status = null, groupJid = null } = {}) {
+    await ensureMigrated();
+    const where = [];
+    const params = [];
+    if (status) {
+      params.push(status);
+      where.push(`status = $${params.length}`);
+    }
+    if (groupJid) {
+      params.push(groupJid);
+      where.push(`group_jid = $${params.length}`);
+    }
+    const clause = where.length ? `where ${where.join(" and ")}` : "";
+    const { rows } = await pool.query(
+      `select * from ${gamesName} ${clause} order by start_at desc, created_at desc`,
+      params
+    );
+    const counts = await playerCounts(rows.map((r) => r.id));
+    return rows.map((r) =>
+      gameToView(r, { playerCount: counts.get(r.id) ?? 0 })
+    );
+  }
+
+  /** One game's public view, or null. */
+  async function getGame(id, { withQuestions = true } = {}) {
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `select * from ${gamesName} where id = $1`,
+      [id]
+    );
+    if (!rows[0]) return null;
+    const counts = await playerCounts([id]);
+    return gameToView(rows[0], {
+      withQuestions,
+      playerCount: counts.get(id) ?? 0,
+    });
+  }
+
+  /** Raw game row (includes the password) for the engine. */
+  async function getGameRow(id) {
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `select * from ${gamesName} where id = $1`,
+      [id]
+    );
+    return rows[0] ?? null;
+  }
+
+  /** Patches a game; only known columns are written. */
+  async function updateGame(id, patch = {}) {
+    await ensureMigrated();
+    const sets = [];
+    const params = [id];
+    for (const [key, column] of Object.entries(GAME_COLUMNS)) {
+      if (!(key in patch) || patch[key] === undefined) continue;
+      const value = key === "questions" ? JSON.stringify(patch[key] ?? []) : patch[key];
+      params.push(value);
+      const cast = key === "questions" ? "::jsonb" : "";
+      sets.push(`${column} = $${params.length}${cast}`);
+    }
+    if (!sets.length) return getGame(id);
+    sets.push(`updated_at = $${params.length + 1}`);
+    params.push(new Date().toISOString());
+    const { rows } = await pool.query(
+      `update ${gamesName} set ${sets.join(", ")} where id = $1 returning *`,
+      params
+    );
+    return rows[0] ? gameToView(rows[0], { withQuestions: true }) : null;
+  }
+
+  /** Convenience wrapper for status transitions. */
+  async function setGameStatus(id, status) {
+    return updateGame(id, { status });
+  }
+
+  /** Deletes a game and (via cascade) its players, sends and answers. */
+  async function deleteGame(id) {
+    await ensureMigrated();
+    const { rowCount } = await pool.query(
+      `delete from ${gamesName} where id = $1`,
+      [id]
+    );
+    return rowCount > 0;
+  }
+
+  /** Scheduled games whose start time has passed. */
+  async function listGamesToStart(now = new Date()) {
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `select * from ${gamesName}
+        where status = 'scheduled' and start_at <= $1
+        order by start_at asc`,
+      [now instanceof Date ? now.toISOString() : now]
+    );
+    return rows;
+  }
+
+  /** Games that should be re-armed after a restart. */
+  async function listActiveGames() {
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `select * from ${gamesName}
+        where status in ('scheduled','lobby','running')
+        order by start_at asc`
+    );
+    return rows;
+  }
+
+  /** Registers a player (idempotent). Keeps an existing name if none given. */
+  async function addGamePlayer(gameId, jid, name = null) {
+    await ensureMigrated();
+    await pool.query(
+      `insert into ${gamePlayersName} (game_id, jid, name, joined_at)
+       values ($1, $2, $3, $4)
+       on conflict (game_id, jid) do update set
+         name = coalesce(excluded.name, ${gamePlayersName}.name)`,
+      [gameId, jid, name, new Date().toISOString()]
+    );
+  }
+
+  /** Drops a player (e.g. they removed their "I'm in" vote). */
+  async function removeGamePlayer(gameId, jid) {
+    await ensureMigrated();
+    const { rowCount } = await pool.query(
+      `delete from ${gamePlayersName} where game_id = $1 and jid = $2`,
+      [gameId, jid]
+    );
+    return rowCount > 0;
+  }
+
+  /** Registered players, best score first (ties broken by lower total time). */
+  async function listGamePlayers(gameId) {
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `select * from ${gamePlayersName} where game_id = $1
+        order by total_points desc, total_time_ms asc, joined_at asc`,
+      [gameId]
+    );
+    return rows.map(gamePlayerToView);
+  }
+
+  /** One registered player's view, or null. */
+  async function getGamePlayer(gameId, jid) {
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `select * from ${gamePlayersName} where game_id = $1 and jid = $2`,
+      [gameId, jid]
+    );
+    return rows[0] ? gamePlayerToView(rows[0]) : null;
+  }
+
+  /** Number of registered players. */
+  async function countGamePlayers(gameId) {
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `select count(*)::int as count from ${gamePlayersName} where game_id = $1`,
+      [gameId]
+    );
+    return Number(rows[0]?.count) || 0;
+  }
+
+  /** Adds a correct-answer result to a player's running totals. */
+  async function addPlayerScore(gameId, jid, { points = 0, correct = false, timeMs = 0 } = {}) {
+    await ensureMigrated();
+    await pool.query(
+      `update ${gamePlayersName}
+          set total_points  = total_points + $3,
+              correct_count = correct_count + $4,
+              total_time_ms = total_time_ms + $5
+        where game_id = $1 and jid = $2`,
+      [gameId, jid, Math.round(points) || 0, correct ? 1 : 0, Math.round(timeMs) || 0]
+    );
+  }
+
+  /** Records a DM poll send (idempotent per poll_message_id). */
+  async function createQuestionSend({
+    id = null,
+    gameId,
+    questionIndex,
+    playerJid,
+    pollMessageId,
+    pollSecret,
+    sentAt = null,
+  }) {
+    await ensureMigrated();
+    await pool.query(
+      `insert into ${questionSendsName}
+         (id, game_id, question_index, player_jid, poll_message_id, poll_secret, sent_at)
+       values ($1,$2,$3,$4,$5,$6,$7)
+       on conflict (poll_message_id) do nothing`,
+      [
+        id ?? randomUUID(),
+        gameId,
+        questionIndex,
+        playerJid,
+        pollMessageId,
+        pollSecret,
+        sentAt ?? new Date().toISOString(),
+      ]
+    );
+  }
+
+  /** Stamps the first delivery receipt for a poll send. */
+  async function markQuestionSendDelivered(pollMessageId, deliveredAt = null) {
+    await ensureMigrated();
+    const { rowCount } = await pool.query(
+      `update ${questionSendsName}
+          set delivered_at = coalesce(delivered_at, $2)
+        where poll_message_id = $1 and delivered_at is null`,
+      [pollMessageId, deliveredAt ?? new Date().toISOString()]
+    );
+    return rowCount > 0;
+  }
+
+  /** The send row a poll vote belongs to, or null. */
+  async function getQuestionSendByPollId(pollMessageId) {
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `select * from ${questionSendsName} where poll_message_id = $1`,
+      [pollMessageId]
+    );
+    return rows[0] ?? null;
+  }
+
+  /** A game's sends, optionally narrowed to one question. */
+  async function listQuestionSends(gameId, questionIndex = null) {
+    await ensureMigrated();
+    const params = [gameId];
+    let clause = "where game_id = $1";
+    if (questionIndex !== null && questionIndex !== undefined) {
+      params.push(questionIndex);
+      clause += ` and question_index = $${params.length}`;
+    }
+    const { rows } = await pool.query(
+      `select * from ${questionSendsName} ${clause}`,
+      params
+    );
+    return rows;
+  }
+
+  /** Marks every send for a question closed (once). */
+  async function closeQuestionSends(gameId, questionIndex, closedAt = null) {
+    await ensureMigrated();
+    await pool.query(
+      `update ${questionSendsName}
+          set closed_at = coalesce(closed_at, $3)
+        where game_id = $1 and question_index = $2`,
+      [gameId, questionIndex, closedAt ?? new Date().toISOString()]
+    );
+  }
+
+  /** Upserts a player's answer for a question. */
+  async function upsertAnswer({
+    gameId,
+    questionIndex,
+    playerJid,
+    selected = [],
+    votedAt = null,
+    points = 0,
+    correct = false,
+    seconds = null,
+  }) {
+    await ensureMigrated();
+    await pool.query(
+      `insert into ${gameAnswersName}
+         (game_id, question_index, player_jid, selected, voted_at, points, correct, seconds)
+       values ($1,$2,$3,$4::jsonb,$5,$6,$7,$8)
+       on conflict (game_id, question_index, player_jid) do update set
+         selected = excluded.selected,
+         voted_at = excluded.voted_at,
+         points   = excluded.points,
+         correct  = excluded.correct,
+         seconds  = excluded.seconds`,
+      [
+        gameId,
+        questionIndex,
+        playerJid,
+        JSON.stringify(selected ?? []),
+        votedAt,
+        Math.round(points) || 0,
+        Boolean(correct),
+        seconds,
+      ]
+    );
+  }
+
+  /** One player's answer for a question, or null. */
+  async function getAnswer(gameId, questionIndex, playerJid) {
+    await ensureMigrated();
+    const { rows } = await pool.query(
+      `select * from ${gameAnswersName}
+        where game_id = $1 and question_index = $2 and player_jid = $3`,
+      [gameId, questionIndex, playerJid]
+    );
+    return rows[0] ? answerToView(rows[0]) : null;
+  }
+
+  /** A game's answers, optionally narrowed to one question. */
+  async function listAnswers(gameId, questionIndex = null) {
+    await ensureMigrated();
+    const params = [gameId];
+    let clause = "where game_id = $1";
+    if (questionIndex !== null && questionIndex !== undefined) {
+      params.push(questionIndex);
+      clause += ` and question_index = $${params.length}`;
+    }
+    const { rows } = await pool.query(
+      `select * from ${gameAnswersName} ${clause}`,
+      params
+    );
+    return rows.map(answerToView);
+  }
+
   /**
    * Deletes every row from every table, in one transaction. Children go first
    * (join/recipient/log tables) so the foreign keys stay satisfied.
@@ -1743,6 +2186,10 @@ export function createPostgresMessageStore({
       autoReplyRulesName,
       awayRepliesName,
       awaySettingsName,
+      gameAnswersName,
+      questionSendsName,
+      gamePlayersName,
+      gamesName,
     ];
     await withTransaction(async (client) => {
       for (const table of tables) await client.query(`delete from ${table}`);
@@ -1810,6 +2257,29 @@ export function createPostgresMessageStore({
     saveAwaySettings,
     markAwayReply,
     hasAwayReply,
+    createGame,
+    listGames,
+    getGame,
+    getGameRow,
+    updateGame,
+    setGameStatus,
+    deleteGame,
+    listGamesToStart,
+    listActiveGames,
+    addGamePlayer,
+    removeGamePlayer,
+    listGamePlayers,
+    getGamePlayer,
+    countGamePlayers,
+    addPlayerScore,
+    createQuestionSend,
+    markQuestionSendDelivered,
+    getQuestionSendByPollId,
+    listQuestionSends,
+    closeQuestionSends,
+    upsertAnswer,
+    getAnswer,
+    listAnswers,
     clearAll,
   };
 }

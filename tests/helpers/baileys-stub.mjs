@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 
 export const DisconnectReason = {
   connectionClosed: 428,
@@ -90,6 +91,31 @@ export async function downloadMediaMessage(message, type, options, ctx) {
   return Buffer.from(`${kind}:${payload?.caption ?? payload?.fileName ?? payload?.url ?? "bytes"}`);
 }
 
+/** Mirrors Baileys sha256 (used to hash poll option names). */
+export function sha256(buffer) {
+  return createHash("sha256").update(buffer).digest();
+}
+
+/**
+ * Test hook for poll votes. Register the decrypted `vote` object the engine
+ * should see for a poll message id (and, optionally, a specific voter jid).
+ * `decryptPollVote` returns it, standing in for the real HMAC decryption.
+ */
+const pollVotes = new Map();
+export function __setPollVote(pollMsgId, vote, voterJid = null) {
+  pollVotes.set(voterJid ? `${pollMsgId}\u0000${voterJid}` : pollMsgId, vote);
+}
+
+/** Stub decryptPollVote: returns the registered vote (see __setPollVote). */
+export function decryptPollVote(_enc, { pollMsgId, voterJid } = {}) {
+  const pair = pollVotes.get(`${pollMsgId}\u0000${voterJid}`);
+  if (pair !== undefined) return pair;
+  const single = pollVotes.get(pollMsgId);
+  if (typeof single === "function") return single({ pollMsgId, voterJid });
+  if (single !== undefined) return single;
+  throw new Error("stub: no poll vote registered");
+}
+
 const sockets = [];
 let sentCounter = 0;
 let groupMetas = {};
@@ -103,6 +129,7 @@ export function __reset() {
   sockets.length = 0;
   sentCounter = 0;
   groupMetas = new Map();
+  pollVotes.clear();
   __downloadCalls.length = 0;
 }
 

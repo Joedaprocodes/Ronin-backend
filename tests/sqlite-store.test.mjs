@@ -1303,6 +1303,10 @@ test("clearAll empties every table", () => {
     "auto_reply_groups",
     "away_settings",
     "away_replies",
+    "games",
+    "game_players",
+    "question_sends",
+    "answers",
   ];
 
   assert.equal(store.clearAll(), tables.length);

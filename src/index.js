@@ -3,6 +3,7 @@ import qrcode from "qrcode-terminal";
 import { WhatsAppConnection } from "./whatsapp/connection.js";
 import { createGuardsEngine } from "./whatsapp/guards.js";
 import { createAutomationEngine } from "./whatsapp/automation.js";
+import { createGameEngine } from "./whatsapp/game.js";
 import { loadConfig } from "./config.js";
 import { createApiServer } from "./api/server.js";
 
@@ -58,12 +59,18 @@ wa.on("ready", async (user) => {
 wa.on("message", (m) => {
   if (m.fromMe) return;
   const where = m.isGroup ? `group ${m.chat}` : "DM";
+  // console.log(m);
   console.log(`[wa] ${where} from ${m.name ?? m.sender}: ${m.text ?? "(non-text message)"}`);
 });
 
 wa.on("disconnected", ({ code }) => console.log(`[wa] disconnected (code: ${code ?? "n/a"})`));
 wa.on("logged_out", () => console.log("[wa] logged out from the phone. Linking starts again."));
 wa.on("failure", (err) => console.error(`[wa] failure: ${err.message}`));
+
+// RoninClash game engine. Handles the scheduled -> lobby -> running -> finished
+// lifecycle: posts the join poll, registers "I'm in" voters, starts on
+// `.start <password>` and DMs each player the questions as polls.
+const games = createGameEngine({ connection: wa, store: messageStore });
 
 // Inbox API (separate from the WhatsApp wiring). Prefers PORT when the host
 // provides one (Render, Railway, Fly, Heroku all inject it), then API_PORT from
@@ -77,6 +84,7 @@ const api = createApiServer({
   broadcastStore: messageStore, // broadcasts + recipients live in the same dual store
   guardStore: messageStore, // guards settings + moderation log live here too
   automationStore: messageStore, // auto-replies + away mode live here too
+  gameEngine: games, // RoninClash scheduling + views
   connection: wa,
   mediaStore,
   // Set API_TOKEN in .env to require the x-api-token header on /api/inbox/:jid/send
@@ -128,6 +136,7 @@ async function shutdown(signal) {
   try {
     guards.stop();
     automation?.stop();
+    games?.stop();
     if (api.listening) await new Promise((resolve) => api.close(resolve));
     await wa.stop(); // waits for the socket to finish closing
     await pool?.end(); // only then release the database pool
